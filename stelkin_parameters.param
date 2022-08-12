@@ -1,0 +1,16 @@
+#Data parameters
+datacube /home/awatts/data/NGC4383/cubes/mosaic/NGC4383_mosaic.fits
+templates /home/awatts/programs/lilpPXF/templates/EMILES
+ouput /home/awatts/projects/NGC4383/spectral\ fitting/outputs
+z 0.005543
+Lmin 4800
+Lmax 7000
+SN_Lmin 4800
+SN_Lmax 5000
+SN_indiv 2
+SN_vorbin 40
+
+#Stellar kinematics
+moments 4
+degree 4
+velscale_ratio 2
