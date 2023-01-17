@@ -1,4 +1,0 @@
-conda create -n pPXFenv python=3.8 numpy astropy scipy matplotlib mpi4py pandas 
-conda activate pPXFenv
-pip install ppxf
-pip install vorbin
