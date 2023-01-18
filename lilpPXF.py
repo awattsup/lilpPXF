@@ -1403,6 +1403,7 @@ def fit_individual_spectrum(parameterfile):
 ###data reading and binning
 
 def read_parameterfile(filename = None):
+
 	if filename is None:
 		filename = "./parameters.param"
 
@@ -1558,8 +1559,6 @@ def read_gaslines_parameterfile(filename = None):
 def make_spectra_tables(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
-
-	# print(parameters)
 
 	if not os.path.isdir(f"{parameters['output']}/indiv"):
 		os.mkdir(f"{parameters['output']}/indiv")
@@ -1805,7 +1804,7 @@ def make_spectra_tables(parameterfile):
 	hdu2 = fits.ImageHDU(noise_testcube,header=noise_header)
 
 	hdul = fits.HDUList([hdu0,hdu1,hdu2])
-	hdul.writeto("./outputs/testcube/testcube.fits",overwrite=True)
+	hdul.writeto(f"{parameters['output']}/testcube/testcube.fits",overwrite=True)
 
 
 	# spax_xx_testcube, spax_yy_testcube = np.meshgrid(np.arange(index_cen_xx,index_edge_xx))
@@ -1994,7 +1993,7 @@ def voronoi_bin_cube(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
-	spax_prop_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+	spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 	SN_indiv = parameters['vorbin_SNmin']
 	SN_vorbin = parameters['vorbin_SNtarget']
 
@@ -2033,7 +2032,7 @@ def voronoi_bin_cube(parameterfile):
 	elif len(SNnames) > 1:
 
 		refs =  np.arange(len(spax_properties),dtype=int)
-		spax_emline_fluxes = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spax_emline_fluxes.fits")
+		spax_emline_fluxes = Table.read(f"{parameters['input_dir']}/spax_emline_fluxes.fits")
 
 		# spax_properties_temp = hstack((spax_properties,spax_emline_fluxes))
 		spax_xx = np.full([len(SNnames),len(spax_properties)],spax_properties['spax_xx']).T
@@ -2097,13 +2096,12 @@ def voronoi_bin_cube(parameterfile):
 																		vorbin_SN[vv]
 
 
-	target_dir = f"{parameters['output']}/{parameters['output_dir']}/"
-	if not os.path.isdir(target_dir):
-		os.mkdir(target_dir)
-		os.mkdir(f"{target_dir}/figures")
+	if not os.path.isdir(f"{parameters['output_dir']}/"):
+		os.mkdir(f"{parameters['output_dir']}/")
+		os.mkdir(f"{parameters['output_dir']}/figures")
 
 	# spax_properties = spax_properties[spax_properties.argsort(spax_properties['vorbin_num'])]
-	spax_properties.write(f"{target_dir}/spaxel_properties.fits",overwrite=True)
+	spax_properties.write(f"{parameters['output_dir']}/spaxel_properties.fits",overwrite=True)
 
 	create_binned_spectra(parameters)
 	make_vorbins_map(parameters)
@@ -2148,15 +2146,13 @@ def create_binned_spectra(parameters = None):
 		parameters = read_parameterfile()
 
 	# print(parameters)
-	spax_prop_file = f"{parameters['output']}/"+\
-						f"{parameters['output_dir']}/"+\
-						f"spaxel_properties.fits"
+	spax_prop_file = f"{parameters['output_dir']}/spaxel_properties.fits"
 	
 	spax_properties = Table.read(spax_prop_file)
 
 	# spectra_file = parameters['vorbin_spectra_file']
 	# if isinstance(spectra_file,type(None)):
-	spectra_file = f"{parameters['output']}/{parameters['input_dir']}/spectra_indiv.fits"
+	spectra_file = f"{parameters['input_dir']}/spectra_indiv.fits"
 
 	hdul = fits.open(spectra_file)
 	header = hdul[0].header
@@ -2233,7 +2229,7 @@ def create_binned_spectra(parameters = None):
 	
 
 	print("Saving vorbin. spectra table")
-	hdul_vorbin.writeto(f"{parameters['output']}/{parameters['output_dir']}/spectra_vorbin.fits",overwrite=True)
+	hdul_vorbin.writeto(f"{parameters['output_dir']}/spectra_vorbin.fits",overwrite=True)
 	print("Saved")
 
 	logRebin_vorbin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda_range,
@@ -2269,7 +2265,7 @@ def create_binned_spectra(parameters = None):
 	
 	hdul_logRebin_vorbin.append(logRebin_vorbin_noise_hdu)
 	print("Saving log-rebinnned. vorbin spectra table")
-	hdul_logRebin_vorbin.writeto(f"{parameters['output']}/{parameters['output_dir']}/logRebin_spectra.fits",overwrite=True)
+	hdul_logRebin_vorbin.writeto(f"{parameters['output_dir']}/logRebin_spectra.fits",overwrite=True)
 	print("Saved")
 
 def read_spectra_hdul(hdul):
@@ -2285,7 +2281,7 @@ def read_spectra_hdul(hdul):
 
 ###template stuff
 def read_EMILES():
-	template_dir = "/Users/00088350/Research/programs/lilpPXF/templates/EMILES"
+	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/EMILES"
 
 	files = glob.glob(template_dir + "/*")
 
@@ -2352,7 +2348,7 @@ def read_EMILES():
 	return templates, linLambda_templates_trunc, wave_step
 
 def read_XSL():	
-	template_dir = "/Users/00088350/Research/programs/lilpPXF/templates/XSL_sorted"
+	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/XSL_sorted"
 
 	files = glob.glob(template_dir + "/*X064*")
 
@@ -2387,7 +2383,7 @@ def read_XSL():
 	return  templates, linLambda_templates_trunc,  wave_step, files
 
 def read_BPASS():
-	template_dir = "/Users/00088350/Research/programs/lilpPXF/templates/BPASS"
+	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}//templates/BPASS"
 
 	files = glob.glob(template_dir + "/*")
 
@@ -2895,9 +2891,7 @@ def get_constraints(parameters, spaxel_properties, vorbin_nums):
 
 ###making maps
 def make_vorbins_map(parameters):
-	spax_prop_file = f"{parameters['output']}/"+\
-						f"{parameters['output_dir']}/"+\
-						f"spaxel_properties.fits"
+	spax_prop_file = f"{parameters['output_dir']}/spaxel_properties.fits"
 
 
 	spax_properties = Table.read(spax_prop_file)
@@ -2919,18 +2913,12 @@ def make_vorbins_map(parameters):
 	ax.pcolormesh(img_grid,cmap='prism')
 	# ax.scatter(spax_properties['spax_xx'],spax_properties['spax_yy'],c=spax_properties['vorbin_num'])
 	# plt.show()
-	fig.savefig(f"{parameters['output']}/"+\
-						f"{parameters['output_dir']}/"+\
-						f"figures/vorbin_map.pdf")
+	fig.savefig(f"{parameters['output_dir']}/figures/vorbin_map.pdf")
 
 def make_stelkin_map(parameters):
-	spax_prop_file = f"{parameters['output']}/"+\
-						f"{parameters['input_dir']}/"+\
-						f"spaxel_properties.fits"
+	spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
-	fit_stellar_kinematics = f"{parameters['output']}/"+\
-						f"{parameters['output_dir']}/"+\
-						f"bestfit_stellar_kinematics.fits"
+	fit_stellar_kinematics = f"{parameters['output_dir']}/bestfit_stellar_kinematics.fits"
 
 	spax_properties = Table.read(spax_prop_file)
 	bestfit_stelkin = Table.read(fit_stellar_kinematics)
@@ -2991,9 +2979,7 @@ def make_stelkin_map(parameters):
 		fig.colorbar(iimmgg)
 		# ax.scatter(spax_properties['spax_xx'],spax_properties['spax_yy'],c=spax_properties['vorbin_num'])
 		# plt.show()
-		fig.savefig(f"{parameters['output']}/"+\
-							f"{parameters['output_dir']}/"+\
-							f"figures/{comp}_map.pdf")
+		fig.savefig(f"{parameters['output_dir']}/figures/{comp}_map.pdf")
 		plt.close()
 ###
 
