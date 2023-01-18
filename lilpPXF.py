@@ -118,7 +118,7 @@ def fit_stellar_kinematics(parameterfile):
 		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
 		spax_properties = Table.read(spax_properties_file)
-		parameters['z'] = spax_properties.meta['z']
+		parameters['z'] = spax_properties.meta['Z']
 
 		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
 		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
@@ -319,7 +319,6 @@ def fit_stellar_kinematics(parameterfile):
 			print(f"Outputs gathered, continuing")
 			print(f"-------------------------")
 			sys.stdout.flush()
-			exit()
 	
 	comm.barrier()
 	if rank == 0:
@@ -2076,7 +2075,7 @@ def voronoi_bin_cube(parameterfile):
 										SN_vorbin, pixelsize=spax_size,
 										plot = False,
 										sn_func = sn_func,
-										quiet=False)
+										quiet=True)
 
 
 	#record vorbin properties for each spaxel
