@@ -1581,7 +1581,7 @@ def make_spectra_tables(parameterfile):
 		Nl = spax_properties.meta['NL']
 
 		hdul = fits.open(f"{parameters['output']}/indiv/spectra_indiv.fits")
-		obsLambda, spectra_list  = read_spectra_hdul(hdul)
+		linLambda_obs, spectra_list  = read_spectra_hdul(hdul)
 		spectra = spectra_list[0]
 		noise = spectra_list[1]
 		spectra_list = None
@@ -1614,17 +1614,17 @@ def make_spectra_tables(parameterfile):
 		spectra = spectra.reshape(Nl, Nx*Ny)
 		noise = noise.reshape(Nl, Nx*Ny)
 
-		obsLambda = astrofunc.get_wavelength_axis(header)
+		linLambda_obs = astrofunc.get_wavelength_axis(header)
 		#de-redshift spectra
-		obsLambda = obsLambda / (1.e0 + parameters['z'])
+		linLambda_obs = linLambda_obs / (1.e0 + parameters['z'])
 
 		if 'lrange' in parameters.keys():
-			Lambda_range = np.logical_and(obsLambda >= parameters['lrange'][0] ,
-									obsLambda <= parameters['lrange'][1])
+			Lambda_range = np.logical_and(linLambda_obs >= parameters['lrange'][0] ,
+									linLambda_obs <= parameters['lrange'][1])
 
 			spectra = spectra[Lambda_range]
 			noise = noise[Lambda_range]
-			obsLambda = obsLambda[Lambda_range]
+			linLambda_obs = linLambda_obs[Lambda_range]
 
 
 		spax_number = np.arange(Nx*Ny,dtype='int')
@@ -1637,8 +1637,8 @@ def make_spectra_tables(parameterfile):
 		spec_bad = np.where(obs_flags_nums == 0)[0]
 
 
-		SN_cont_Lrange = np.logical_and(obsLambda >= parameters['SN_lrange'][0] , 
-										obsLambda <= parameters['SN_lrange'][1])
+		SN_cont_Lrange = np.logical_and(linLambda_obs >= parameters['SN_lrange'][0] , 
+										linLambda_obs <= parameters['SN_lrange'][1])
 		spax_signal_cont = np.nanmedian(spectra[SN_cont_Lrange,:], axis = 0)
 		spax_noise_cont = np.abs(np.nanmedian(noise[SN_cont_Lrange,:], axis = 0))
 
@@ -1653,8 +1653,8 @@ def make_spectra_tables(parameterfile):
 				
 		# 		lineLambda = emlines[parameters['SN_line'][ii]]['lambda'][-1]
 
-		# 		SN_line_Lrange = np.logical_and(obsLambda >= lineLambda*(1-500/c) , 
-		# 								obsLambda <= lineLambda*(1+500/c) )
+		# 		SN_line_Lrange = np.logical_and(linLambda_obs >= lineLambda*(1-500/c) , 
+		# 								linLambda_obs <= lineLambda*(1+500/c) )
 		# 		spax_signal_line[:,ii] = np.nansum(spectra[SN_line_Lrange,:], axis = 0)
 		# 		spax_noise_line[:,ii] = np.nansum(noise[SN_line_Lrange,:], axis = 0)
 
@@ -1706,7 +1706,7 @@ def make_spectra_tables(parameterfile):
 		#save individual spectra
 		indiv_header = fits.Header()
 		indiv_header['COMMENT'] = "A.B. Watts"
-		indiv_primary_hdu = fits.PrimaryHDU(data = obsLambda,
+		indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
 											header = indiv_header)
 
 		indiv_spectra_hdu = fits.BinTableHDU.from_columns(
@@ -1732,10 +1732,10 @@ def make_spectra_tables(parameterfile):
 
 		#log-rebin the individual spectra
 		print("log-rebinning the individual spectra")
-		logRebin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda,
+		logRebin_spectra, logLambda, velscale = pputils.log_rebin(linLambda_obs,
 																	spectra)
 
-		logRebin_noise, logLambda1, velscale1 = pputils.log_rebin(obsLambda,
+		logRebin_noise, logLambda1, velscale1 = pputils.log_rebin(linLambda_obs,
 																	noise)
 		print("Done")
 		
@@ -1841,7 +1841,7 @@ def make_spectra_tables(parameterfile):
 	#save individual testcube spectra
 	indiv_header = fits.Header()
 	indiv_header['COMMENT'] = "A.B. Watts"
-	indiv_primary_hdu = fits.PrimaryHDU(data = obsLambda,
+	indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
 										header = indiv_header)
 
 	indiv_spectra_hdu = fits.BinTableHDU.from_columns(
@@ -1934,7 +1934,7 @@ def make_spectra_tables(parameterfile):
 	#save individual test spectra
 	indiv_header = fits.Header()
 	indiv_header['COMMENT'] = "A.B. Watts"
-	indiv_primary_hdu = fits.PrimaryHDU(data = obsLambda,
+	indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
 										header = indiv_header)
 
 	indiv_spectra_hdu = fits.BinTableHDU.from_columns(
@@ -2157,7 +2157,7 @@ def create_binned_spectra(parameters = None):
 	hdul = fits.open(spectra_file)
 	header = hdul[0].header
 	#is there a faster way to read these?
-	obsLambda, spectra_list = read_spectra_hdul(hdul)
+	linLambda_obs, spectra_list = read_spectra_hdul(hdul)
 	hdul.close()
 	spectra = spectra_list[0]
 	noise = spectra_list[1]
@@ -2166,7 +2166,7 @@ def create_binned_spectra(parameters = None):
 	# 	hdul = fits.open(spectra_file)
 	# 	header = hdul[0].header
 	# 	#is there a faster way to read these?
-	# 	obsLambda, spectra_list = read_spectra_hdul(hdul)
+	# 	linLambda_obs, spectra_list = read_spectra_hdul(hdul)
 	# 	spectra = spectra_list[0]
 	# 	varbin_flag = False
 	# 	# print(header)
@@ -2176,8 +2176,7 @@ def create_binned_spectra(parameters = None):
 	# else:
 	# 	logRebin_flag = True
 
-	
-	obsLambda_range = [obsLambda[0],obsLambda[-1]]
+
 
 	vorbin_nums = np.unique(spax_properties['vorbin_num'])
 	vorbin_nums = np.sort(vorbin_nums[vorbin_nums >= 0])
@@ -2200,13 +2199,13 @@ def create_binned_spectra(parameters = None):
 	# 	for nn in vorbin_nums:
 	# 		inbin = np.where(spax_properties['vorbin_num'][:] == nn)[0]
 	# 		logRebin_vorbin_spectra[:,nn] = np.sum(spectra[:,inbin], axis=1)
-	# 	logLambda = obsLambda
+	# 	logLambda = linLambda_obs
 
 	# if logRebin_flag:
 		#save vorbin spectra
 	vorbin_header = fits.Header()
 	vorbin_header['COMMENT'] = "A.B. Watts"
-	vorbin_primary_hdu = fits.PrimaryHDU(data = obsLambda,
+	vorbin_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
 											header = vorbin_header)
 
 	vorbin_spectra_hdu = fits.BinTableHDU.from_columns(
@@ -2232,11 +2231,11 @@ def create_binned_spectra(parameters = None):
 	hdul_vorbin.writeto(f"{parameters['output_dir']}/spectra_vorbin.fits",overwrite=True)
 	print("Saved")
 
-	logRebin_vorbin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda_range,
+	logRebin_vorbin_spectra, logLambda, velscale = pputils.log_rebin(linLambda_obs,
 																vorbin_spectra)
 	
 	# if varbin_flag:
-	logRebin_vorbin_noise, logLambda1, velscale1 = pputils.log_rebin(obsLambda_range,
+	logRebin_vorbin_noise, logLambda1, velscale1 = pputils.log_rebin(linLambda_obs,
 																vorbin_noise)
 
 	#save log-rebinned vorbin spectra
