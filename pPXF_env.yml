@@ -1,0 +1,18 @@
+name: pPXFenv3
+channels: 
+- conda-forge
+- defaults
+dependencies: 
+  - python=3.11
+  - numpy
+  - astropy
+  - scipy
+  - matplotlib
+  - mpi4py
+  - openmpi
+  - pandas
+  - spectral-cube
+  # - pip
+#pip: 
+ #- vorbin
+ #- ppxf

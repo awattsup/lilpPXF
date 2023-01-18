@@ -284,7 +284,6 @@ def fit_stellar_kinematics(parameterfile):
 		# print(vorbin_num)
 		outputs.append([vorbin_num, out.chi2,out.sol,out.error*np.sqrt(out.chi2),out.bestfit*spec_median, out.weights,out.apoly,out.mpoly])
 		
-	
 		if vb%100 == 0 and vb !=0:
 			comm.barrier()
 			if rank == 0:
@@ -704,7 +703,6 @@ def fit_individual_continuum(parameterfile):
 		print("Saved")
 		sys.stdout.flush()
 
-
 def fit_continuum(parameterfile):
 
 	comm = MPI.COMM_WORLD
@@ -987,7 +985,6 @@ def fit_continuum(parameterfile):
 		print("Saved")
 		sys.stdout.flush()
 			
-
 def fit_gas_lines(parameterfile):
 
 	comm = MPI.COMM_WORLD
@@ -1246,7 +1243,6 @@ def fit_gas_lines(parameterfile):
 		print("Saving bestfit gas kinematics table")
 		gas_kin.write(f"{parameters['output']}/{parameters['output_dir']}/bestfit_gas_kinematics.fits",overwrite=True)
 		# spax_properties.write(spax_properties_file,overwrite=True)
-
 
 def fit_individual_spectrum(parameterfile):
 	parameters = read_parameterfile(parameterfile)
@@ -1587,7 +1583,6 @@ def make_spectra_tables(parameterfile):
 		spectra = hdu[1].data
 		noise = np.sqrt(hdu[2].data)
 
-
 		Nx = header['NAXIS1']
 		Ny = header['NAXIS2']
 		Nl = header['NAXIS3']
@@ -1599,12 +1594,13 @@ def make_spectra_tables(parameterfile):
 		#de-redshift spectra
 		obsLambda = obsLambda / (1.e0 + parameters['z'])
 
-		Lambda_range = np.logical_and(obsLambda >= parameters['lrange'][0] ,
+		if 'lrange' in parameters.keys():
+			Lambda_range = np.logical_and(obsLambda >= parameters['lrange'][0] ,
 									obsLambda <= parameters['lrange'][1])
 
-		spectra = spectra[Lambda_range]
-		noise = noise[Lambda_range]
-		obsLambda = obsLambda[Lambda_range]
+			spectra = spectra[Lambda_range]
+			noise = noise[Lambda_range]
+			obsLambda = obsLambda[Lambda_range]
 
 
 		spax_number = np.arange(Nx*Ny,dtype='int')
@@ -1639,11 +1635,10 @@ def make_spectra_tables(parameterfile):
 		# 		spax_noise_line[:,ii] = np.nansum(noise[SN_line_Lrange,:], axis = 0)
 
 
-
 		spax_xxyy , spax_RADEC, spax_SP = astrofunc.make_pix_WCS_grids(header)
 		spax_size = np.abs(np.diff(spax_SP[0])[0])
 
-		spax_properties = np.column_stack([spax_number,
+		spax_properties = np.column_stack([spax_number.astype(int),
 										vorbin_number,
 										obs_flags_nums,
 										spax_xxyy[0].reshape(Nx*Ny).astype(int),
@@ -1712,7 +1707,6 @@ def make_spectra_tables(parameterfile):
 		print("Saved")
 
 		#log-rebin the individual spectra
-		obsLambda_range = obsLambda[[0,-1]]
 		print("log-rebinning the individual spectra")
 		logRebin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda_range,
 																	spectra)
@@ -1759,14 +1753,12 @@ def make_spectra_tables(parameterfile):
 	index_cen_xx = int(Nx*0.5)
 	index_cen_yy = int(Ny*0.5)
 
-
 	yy_num = int(2.e4 / index_cen_xx)
 	xx_edge = int(Nx)
 	yy_edge = int(index_cen_yy + yy_num)
 
 	index_xx = [index_cen_xx,xx_edge]
 	index_yy = [index_cen_yy,yy_edge]
-
 
 
 	testcube = extract_subcube(parameters['datacube'],["all",index_xx,index_yy],hdu=1)
@@ -1879,7 +1871,6 @@ def make_spectra_tables(parameterfile):
 	print("Saving log-rebinnned indiv. testcube spectra table")
 	hdul_logRebin.writeto(f"{parameters['output']}/testcube/logRebin_spectra.fits",overwrite=True)
 	print("Saved")
-
 
 
 
