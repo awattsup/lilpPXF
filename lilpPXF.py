@@ -29,7 +29,8 @@ from astropy.io import fits
 from ppxf.ppxf import ppxf
 import ppxf.ppxf_util as pputils
 
-sys.path.append('/Users/00088350/Research/programs/astro-functions')
+home_dir = os.path.expanduser('~')
+sys.path.append(f'{home_dir}/Research/programs/astro-functions')
 import astro_functions as astrofunc
 
 from spectral_cube import SpectralCube
@@ -84,6 +85,21 @@ emlines = {		'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				'ArIV':{	'lambda':[4740.120],			'ratio':[1]},						#high ionisation 40.74
 				}
 
+###program caller
+def run():
+
+	parameterfile = sys.argv[1]
+	parameters = read_parameterfile(parameterfile)
+
+	if parameters['read_data']:
+		make_spectra_tables(parameterfile)
+
+	if parameters['run_vorbin']:
+		voronoi_bin_cube(parameterfile)
+
+	if parameters['run_stelkin']:
+		fit_stellar_kinematics(parameterfile)
+###
 
 
 #main fitting functions
@@ -99,14 +115,15 @@ def fit_stellar_kinematics(parameterfile):
 		sys.stdout.flush()
 		parameters = read_parameterfile(parameterfile)
 		
-		spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
 		spax_properties = Table.read(spax_properties_file)
-		# print(spax_properties)
+		parameters['z'] = spax_properties.meta['z']
+
 		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
 		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
 
-		spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 		hdul = fits.open(spectra_file)
 		logLambda_spec, spectra  = read_spectra_hdul(hdul)
@@ -282,24 +299,34 @@ def fit_stellar_kinematics(parameterfile):
 		# exit()
 
 		# print(vorbin_num)
-		outputs.append([vorbin_num, out.chi2,out.sol,out.error*np.sqrt(out.chi2),out.bestfit*spec_median, out.weights,out.apoly,out.mpoly])
-		
+		error = out.error
+		if not isinstance(out.error[0],float):
+			error = out.error[0]
+		outputs.append([vorbin_num, out.chi2,out.sol,error*np.sqrt(out.chi2),out.bestfit*spec_median, out.weights,out.apoly,out.mpoly])
+	
 		if vb%100 == 0 and vb !=0:
 			comm.barrier()
 			if rank == 0:
 				print(f"Proc {rank} is {100*vb/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
 				print(f"Gathering outputs so far")
-				print(f"-------------------------")
+				# print(f"-------------------------")
 			sys.stdout.flush()
 
 			outputs = comm.gather(outputs,root=0)
 			if rank == 0:
 				outputs_all.extend(outputs)
 			outputs = []
+			print(f"Outputs gathered, continuing")
+			print(f"-------------------------")
+			sys.stdout.flush()
+			exit()
 	
 	comm.barrier()
 	if rank == 0:
 		print("pPXF fits finished, gathering last outputs to head node")
+		print(f"-------------------------")	
+		sys.stdout.flush()
+
 	outputs = comm.gather(outputs,root=0)
 	if rank == 0:
 		outputs_all.extend(outputs)
@@ -347,6 +374,7 @@ def fit_stellar_kinematics(parameterfile):
 					('chi2','V_stellar','sigma_stellar','h3_stellar','h4_stellar',
 						'V_stellar_err','sigma_stellar_err','h3_stellar_err','h4_stellar_err'))
 		print("Saving bestfit stellar kinematics table")
+		sys.stdout.flush()
 		stellar_kin.write(f"{parameters['output']}/{parameters['output_dir']}/bestfit_stellar_kinematics.fits",overwrite=True)
 		
 
@@ -404,6 +432,7 @@ def fit_stellar_kinematics(parameterfile):
 		sys.stdout.flush()
 
 		print("Making stellar kinematics maps")
+		sys.stdout.flush()
 		make_stelkin_map(parameters)
 
 def fit_individual_continuum(parameterfile):
@@ -1368,14 +1397,22 @@ def fit_individual_spectrum(parameterfile):
 				quiet=False)
 	# print(out.error*np.sqrt(out.chi2))
 	plt.show()
+###
 
-#data reading and binning
+
+###data reading and binning
 
 def read_parameterfile(filename = None):
 	if filename is None:
 		filename = "./parameters.param"
 
-	parameters = {}
+
+	#default values
+	parameters = {'read_data':False,'run_vorbin':False,'run_stelkin':False,
+					'base':home_dir,
+					'velscale_ratio': 1,
+					'gas_groups': None,'gas_names': None,'gas_Ncomp': [],'gas_constraints': None,
+					'fit_CaT':False}
 
 
 	f = open(filename)
@@ -1386,8 +1423,13 @@ def read_parameterfile(filename = None):
 			continue
 		else:
 			line = line.split("\n")[0].split(" ")
-			# print(line)
-			# print(line[0])
+
+			if line[0] == "read_data":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "run_vorbin":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "run_stelkin":
+				parameters[line[0]] = eval(line[1])
 
 			if line[0] == "datacube":
 				parameters[line[0]] = line[1]
@@ -1411,10 +1453,10 @@ def read_parameterfile(filename = None):
 			# 	parameters[line[0]] = np.asarray(int(line[1]),dtype=bool)
 			# elif line[0] == "continuum_subcube":
 			# 	parameters[line[0]] = np.asarray(int(line[1]),dtype=bool)
-			elif line[0] == "input_dir":
-				parameters[line[0]] = line[1]
-			elif line[0] == "output_dir":
-				parameters[line[0]] = line[1]
+			# elif line[0] == "input_dir":
+			# 	parameters[line[0]] = line[1]
+			# elif line[0] == "output_dir":
+			# 	parameters[line[0]] = line[1]
 			elif "_start" in line[0]:
 				parameters[line[0]] = [float(line[1]),float(line[2])]
 			elif "_lrange" in line[0]:
@@ -1448,8 +1490,6 @@ def read_parameterfile(filename = None):
 					except:
 						parameters[line[0]] = line[1]
 
-
-
 			# else:
 			# 	parameters[line[0]] = [int(x) for x in line[1::]]
 
@@ -1458,26 +1498,13 @@ def read_parameterfile(filename = None):
 			# else:
 			# 	parameters[line[0]] = [int(x) for x in line[1::]]
 
-	# print(parameters)
-	# exit()
-	# parameters['velscale_ratio'] = int(parameters['velscale_ratio'])
+	parameters['output'] = f"{parameters['base']}/{parameters['output']}"
+	parameters['output_dir'] = f"{parameters['output']}/{parameters['output_dir']}"
+	if "input_dir" in parameters.keys():
+		parameters['input_dir'] = f"{parameters['output']}/{parameters['input_dir']}"
 
-	if 'gas_groups' not in parameters.keys():
-		parameters['gas_groups'] = None
-		parameters['gas_names'] = None
-		parameters['gas_Ncomp'] = []
-		parameters['gas_constraints'] = None
-
-	if "input_dir" not in parameters.keys():
+	else:
 		parameters['input_dir'] = parameters['output_dir']
-
-	if 'fit_CaT' not in parameters.keys():
-		parameters['fit_CaT'] = False
-	
-
-	# if "stars_lrange" not in parameters.keys():
-	# 	parameters['stars_lrange'] = [parameters['Lmin'],parameters['Lmax']]
-
 
 	return parameters
 
@@ -1528,12 +1555,11 @@ def read_gaslines_parameterfile(filename = None):
 
 	return [gas_groups, gas_names, gas_Ncomp, constr_kinem]
 
-
 def make_spectra_tables(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
-	print(parameters)
+	# print(parameters)
 
 	if not os.path.isdir(f"{parameters['output']}/indiv"):
 		os.mkdir(f"{parameters['output']}/indiv")
@@ -1573,7 +1599,6 @@ def make_spectra_tables(parameterfile):
 		hdul.close()
 
 		print("All read in")
-
 
 	else:
 
@@ -1657,7 +1682,7 @@ def make_spectra_tables(parameterfile):
 		#trim to only good observed spaxels to save memory
 		spax_properties = spax_properties[spec_good]
 
-		metadata = {'Nx':Nx,'Ny':Ny,'Nl':Nl,'d_spax':spax_size}
+		metadata = {'Nx':Nx,'Ny':Ny,'Nl':Nl,'d_spax':spax_size,'z':parameters['z']}
 
 		spax_properties = Table(spax_properties,
 					names=['spax_num','vorbin_num','obs_flag','spax_xx','spax_yy',
@@ -1708,10 +1733,10 @@ def make_spectra_tables(parameterfile):
 
 		#log-rebin the individual spectra
 		print("log-rebinning the individual spectra")
-		logRebin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda_range,
+		logRebin_spectra, logLambda, velscale = pputils.log_rebin(obsLambda,
 																	spectra)
 
-		logRebin_noise, logLambda1, velscale1 = pputils.log_rebin(obsLambda_range,
+		logRebin_noise, logLambda1, velscale1 = pputils.log_rebin(obsLambda,
 																	noise)
 		print("Done")
 		
@@ -1965,10 +1990,9 @@ def make_spectra_tables(parameterfile):
 	hdul_logRebin.writeto(f"{parameters['output']}/test/logRebin_spectra.fits",overwrite=True)
 	print("Saved")
 
-def voronoi_bin_cube(parameters =  None):
+def voronoi_bin_cube(parameterfile):
 
-	if parameters is None:
-		parameters = read_parameterfile()
+	parameters = read_parameterfile(parameterfile)
 
 	spax_prop_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
 	SN_indiv = parameters['vorbin_SNmin']
@@ -2082,10 +2106,9 @@ def voronoi_bin_cube(parameters =  None):
 	spax_properties.write(f"{target_dir}/spaxel_properties.fits",overwrite=True)
 
 	create_binned_spectra(parameters)
-
 	make_vorbins_map(parameters)
 
-def voronoi_multiSN_function(index,signal =  None,noise = None):
+def voronoi_multiSN_function(index, signal =  None, noise = None):
 
 	if signal.ndim ==1:
 		sn = np.sum(signal[index]) / np.sqrt(np.sum(noise**2))
@@ -2257,6 +2280,7 @@ def read_spectra_hdul(hdul):
 		spectra.append(np.asarray([dd[0] for dd in hdu.data]).T)
 
 	return wave, spectra
+###
 
 
 ###template stuff
@@ -2531,7 +2555,6 @@ def get_templates(parameters):
 
 	return logLambda_templates, templates, components, gas_components
 
-
 def get_stellar_templates_testing(parameters, match_velscale=True, convolve = True, logRebin = True, regrid=False):
 
 	if parameters is None:
@@ -2629,7 +2652,6 @@ def get_stellar_templates_testing(parameters, match_velscale=True, convolve = Tr
 
 
 	return logLambda_templates, stellar_templates_final
-
 
 def create_spectrum_mask(logLambda, parameters):
 
@@ -2868,9 +2890,10 @@ def get_constraints(parameters, spaxel_properties, vorbin_nums):
 
 
 	return start, moments, constraints
+###
 
 
-#making maps
+###making maps
 def make_vorbins_map(parameters):
 	spax_prop_file = f"{parameters['output']}/"+\
 						f"{parameters['output_dir']}/"+\
@@ -2972,8 +2995,7 @@ def make_stelkin_map(parameters):
 							f"{parameters['output_dir']}/"+\
 							f"figures/{comp}_map.pdf")
 		plt.close()
-
-
+###
 
 
 ##### things for analysing outputs #####
