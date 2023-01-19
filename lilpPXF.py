@@ -85,6 +85,49 @@ emlines = {		'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				'ArIV':{	'lambda':[4740.120],			'ratio':[1]},						#high ionisation 40.74
 				}
 
+emlines_indiv = {'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
+				'Halpha':{	'lambda':[6562.819],			'ratio':[1]},
+				
+				'Pa9':{		'lambda':[9229.014],			'ratio':[1]},
+				'Pa10':{	'lambda':[9014.909],			'ratio':[1]},
+				'Pa11':{	'lambda':[8862.782],			'ratio':[1]},
+				'Pa12':{	'lambda':[8750.472],			'ratio':[1]},
+				'Pa13':{	'lambda':[8665.019],			'ratio':[1]},			#overlaps with CaT line!!
+				'Pa14':{	'lambda':[8598.392],			'ratio':[1]},
+				'Pa15':{	'lambda':[8545.383],			'ratio':[1]},			#overlaps with CaT line!!
+				'Pa16':{	'lambda':[8502.483],			'ratio':[1]},			#overlaps with CaT line!!
+				# 'Pa17':{	'lambda':[8467.254],			'ratio':[1]},
+				'Pa18':{	'lambda':[8437.956],			'ratio':[1]},
+				# 'Pa19':{	'lambda':[8413.318],			'ratio':[1]},
+				# 'Pa20':{	'lambda':[8392.397],			'ratio':[1]},
+
+				'OI6300':{	'lambda':[6300.304],	'ratio':[1]},					#low ionisation 14.53
+				'OI6364':{	'lambda':[6363.78],		'ratio':[1]},					#low ionisation 14.53
+				'OI8446': {	'lambda':[8446.359],			'ratio':[1]},
+				'OII7312':{	'lambda':[7319.990],	'ratio':[1]}, #?? check 			#low ionisation 13.62
+				'OII7330':{	'lambda':[7330.730],	'ratio':[1]}, #?? check 			#low ionisation 13.62
+				'OIII4959':{'lambda':[4958.911],	'ratio':[1]}, 					#high ionisation 35.12
+				'OIII5006':{'lambda':[5006.843],	'ratio':[1]}, 					#high ionisation 35.12
+
+				'NI':{ 		'lambda':[5200.257],			'ratio':[1]},
+			 	'NII6548':{		'lambda':[6548.050],	'ratio':[1]},					#low ionisation 15.43
+			 	'NII6583':{		'lambda':[6583.460],	'ratio':[1]},					#low ionisation 15.43
+
+			 	
+				'HeI5876':{	'lambda':[5875.624],			'ratio':[1]}, 
+				'HeI6678':{	'lambda':[6678.151],			'ratio':[1]}, 
+				'HeI7065':{'lambda':[7065.196], 			'ratio':[1]},
+				'HeII4685':{'lambda':[4685.710],			'ratio':[1]}, 
+
+				'SII6716':{	'lambda':[6716.440],			'ratio':[1]},						#low ionisation 10.36
+				'SII6730':{	'lambda':[6730.810],			'ratio':[1]},						#^^
+				'SIII9069':{'lambda':[9068.6],				'ratio':[1]},						#high ionisation 23.33
+				
+				'ArIII7135':{'lambda':[7135.790],			'ratio':[1]}, 						#high ionisation 27.63 #doublet**
+				'ArIII7751':{'lambda':[7751.060],			'ratio':[1]},						#high ionisation 27.63
+				'ArIV4711':{	'lambda':[4711.260],			'ratio':[1]}, 						#high ionisation 40.74 #doublet**
+				'ArIV4740':{	'lambda':[4740.120],			'ratio':[1]},						#high ionisation 40.74
+				}
 ###program caller
 def run():
 
@@ -170,7 +213,6 @@ def fit_stellar_kinematics(parameterfile):
 		# constraints = None
 		components = None
 		gas_components = None
-		components = None
 		dv = None
 		templates = None
 		good_pixels = None
@@ -298,11 +340,13 @@ def fit_stellar_kinematics(parameterfile):
 		# plt.show()
 		# exit()
 
-		# print(vorbin_num)
+		sol = out.sol
 		error = out.error
-		if not isinstance(out.error[0],float):
+		if not isinstance(out.sol[0],float):
+			sol = out.sol[0]
 			error = out.error[0]
-		outputs.append([vorbin_num, out.chi2,out.sol,error*np.sqrt(out.chi2),out.bestfit*spec_median, out.weights,out.apoly,out.mpoly])
+
+		outputs.append([vorbin_num, out.chi2,sol,error*np.sqrt(out.chi2),out.bestfit*spec_median, out.weights,out.apoly,out.mpoly])
 	
 		if vb%100 == 0 and vb !=0:
 			comm.barrier()
@@ -365,24 +409,21 @@ def fit_stellar_kinematics(parameterfile):
 			mpy[:,vorbin_num] = out[7]
 
 		
-		if not os.path.isdir(f"{parameters['output']}/{parameters['output_dir']}"):
-			os.mkdir(f"{parameters['output']}/{parameters['output_dir']}")
-			os.mkdir(f"{parameters['output']}/{parameters['output_dir']}/figures")
+		if not os.path.isdir(f"{parameters['output_dir']}"):
+			os.mkdir(f"{parameters['output_dir']}")
+			os.mkdir(f"{parameters['output_dir']}/figures")
 		
 		stellar_kin = Table(stellar_kin,names=
 					('chi2','V_stellar','sigma_stellar','h3_stellar','h4_stellar',
 						'V_stellar_err','sigma_stellar_err','h3_stellar_err','h4_stellar_err'))
 		print("Saving bestfit stellar kinematics table")
 		sys.stdout.flush()
-		stellar_kin.write(f"{parameters['output']}/{parameters['output_dir']}/bestfit_stellar_kinematics.fits",overwrite=True)
+		stellar_kin.write(f"{parameters['output_dir']}/bestfit_stellar_kinematics.fits",overwrite=True)
 		
-
-		print(template_weights)
-
 		# weights = Table(np.asarray(template_weights),names=
 		# 			('weights','apoly','mpoly'))
 		# print("Saving templates table")
-		# weights.write(f"{parameters['output']}/{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
+		# weights.write(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
 		header["COMMENT1"] = "Best fit weights for bins"
 		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
 
@@ -408,7 +449,7 @@ def fit_stellar_kinematics(parameterfile):
 								)]))
 
 		hdul = fits.HDUList([primary_hdu,weights_hdu,apoly_hdu, mpoly_hdu])		
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
 
 
 
@@ -426,7 +467,7 @@ def fit_stellar_kinematics(parameterfile):
 							bestfit_stars_hdu])
 		print("Saving best fit spectra table")
 		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/logRebin_stelkin_spectra.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/logRebin_stelkin_spectra.fits",overwrite=True)
 		print("Saved")
 		sys.stdout.flush()
 
@@ -447,10 +488,10 @@ def fit_individual_continuum(parameterfile):
 		sys.stdout.flush()
 		parameters = read_parameterfile(parameterfile)
 		
-		spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 		spax_properties = Table.read(spax_properties_file)
 
-		spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 		hdul = fits.open(spectra_file)
 		logLambda_spec, spectra  = read_spectra_hdul(hdul)
 		logRebin_spectra = spectra[0]
@@ -721,13 +762,13 @@ def fit_individual_continuum(parameterfile):
 							bestfit_continuum_hdu,
 							bestfit_gas_hdu])
 			
-		if not os.path.isdir(f"{parameters['output']}/{parameters['output_dir']}"):
-			os.mkdir(f"{parameters['output']}/{parameters['output_dir']}")
-			os.mkdir(f"{parameters['output']}/{parameters['output_dir']}/figures")
+		if not os.path.isdir(f"{parameters['output_dir']}"):
+			os.mkdir(f"{parameters['output_dir']}")
+			os.mkdir(f"{parameters['output_dir']}/figures")
 
 		print("Saving continuum spectra table")
 		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
 		print("Saved")
 		sys.stdout.flush()
 
@@ -750,9 +791,9 @@ def fit_continuum(parameterfile):
 		else:
 			gas_flag = False
 
-		spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
-		spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 
 		spax_properties = Table.read(spax_properties_file)
@@ -1009,7 +1050,7 @@ def fit_continuum(parameterfile):
 							bestfit_gas_hdu])
 		print("Saving continuum spectra table")
 		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
 		print("Saved")
 		sys.stdout.flush()
 			
@@ -1025,9 +1066,9 @@ def fit_gas_lines(parameterfile):
 		sys.stdout.flush()
 		parameters = read_parameterfile(parameterfile)
 		
-		spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
-		spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 
 		spax_properties = Table.read(spax_properties_file)
@@ -1056,7 +1097,7 @@ def fit_gas_lines(parameterfile):
 
 		good_pixels = create_spectrum_mask(logLambda_spec,parameters,gas_fit=True)
 
-		stellar_kin_file = f"{parameters['output']}/{parameters['output_dir']}/bestfit_stellar_kinematics.fits"
+		stellar_kin_file = f"{parameters['output_dir']}/bestfit_stellar_kinematics.fits"
 		stel_kin = Table.read(stellar_kin_file)
 		# stel_kin = stel_kin['V_stellar','sigma_stellar',
 											# 'h3_stellar','h4_stellar'][:]
@@ -1269,15 +1310,15 @@ def fit_gas_lines(parameterfile):
 				
 		gas_kin = Table(gas_kin,names=names)
 		print("Saving bestfit gas kinematics table")
-		gas_kin.write(f"{parameters['output']}/{parameters['output_dir']}/bestfit_gas_kinematics.fits",overwrite=True)
+		gas_kin.write(f"{parameters['output_dir']}/bestfit_gas_kinematics.fits",overwrite=True)
 		# spax_properties.write(spax_properties_file,overwrite=True)
 
 def fit_individual_spectrum(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 		
-	spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+	spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
-	spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+	spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 
 	spax_properties = Table.read(spax_properties_file)
@@ -1400,7 +1441,6 @@ def fit_individual_spectrum(parameterfile):
 
 
 ###data reading and binning
-
 def read_parameterfile(filename = None):
 
 	if filename is None:
@@ -1624,6 +1664,7 @@ def make_spectra_tables(parameterfile):
 			spectra = spectra[Lambda_range]
 			noise = noise[Lambda_range]
 			linLambda_obs = linLambda_obs[Lambda_range]
+
 
 
 		spax_number = np.arange(Nx*Ny,dtype='int')
@@ -1988,6 +2029,15 @@ def make_spectra_tables(parameterfile):
 	hdul_logRebin.writeto(f"{parameters['output']}/test/logRebin_spectra.fits",overwrite=True)
 	print("Saved")
 
+def read_spectra_hdul(hdul):
+
+	wave = np.asarray(hdul[0].data)
+	spectra = []
+	for hdu in hdul[1::]:
+		spectra.append(np.asarray([dd[0] for dd in hdu.data]).T)
+
+	return wave, spectra
+
 def voronoi_bin_cube(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
@@ -2265,15 +2315,6 @@ def create_binned_spectra(parameters = None):
 	print("Saving log-rebinnned. vorbin spectra table")
 	hdul_logRebin_vorbin.writeto(f"{parameters['output_dir']}/logRebin_spectra.fits",overwrite=True)
 	print("Saved")
-
-def read_spectra_hdul(hdul):
-
-	wave = np.asarray(hdul[0].data)
-	spectra = []
-	for hdu in hdul[1::]:
-		spectra.append(np.asarray([dd[0] for dd in hdu.data]).T)
-
-	return wave, spectra
 ###
 
 
@@ -2987,18 +3028,18 @@ def make_continuum_subtracted_spectra(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 	Nx = spax_properties.meta['NX']
 	Ny = spax_properties.meta['NY']
 
-	spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+	spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
 	hdul.close()
 	galaxy_spectra = spectra[0]
 	noise_spectra = spectra[1]
 
-	bestfit_continuum_file = f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_spectra.fits"
+	bestfit_continuum_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
 	hdul = fits.open(bestfit_continuum_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
 	hdul.close()
@@ -3066,7 +3107,7 @@ def make_continuum_subtracted_spectra(parameterfile):
 	hdul = fits.HDUList([primary_hdu,
 								spectra_hdu, noise_hdu])
 	print("Saving continuum-subtracted spectra table")
-	hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/logRebin_contsub_spectra.fits",overwrite=True)
+	hdul.writeto(f"{parameters['output_dir']}/logRebin_contsub_spectra.fits",overwrite=True)
 	print("Saved")
 
 
@@ -3104,7 +3145,7 @@ def make_continuum_subtracted_spectra(parameterfile):
 	# hdul = fits.HDUList([primary_hdu,
 	# 							galaxy_cube_hdu])
 	# print("Saving log-rebinned galaxy cube")
-	# hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/logRebingalaxy_cube.fits",overwrite=True)
+	# hdul.writeto(f"{parameters['output_dir']}/logRebingalaxy_cube.fits",overwrite=True)
 	# print("Saved")
 
 
@@ -3116,7 +3157,7 @@ def make_continuum_subtracted_spectra(parameterfile):
 	# hdul = fits.HDUList([primary_hdu,
 	# 							continuum_cube_hdu])
 	# print("Saving bestfit continuum cube")
-	# hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_cube.fits",overwrite=True)
+	# hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_cube.fits",overwrite=True)
 	# print("Saved")
 
 
@@ -3130,7 +3171,7 @@ def make_continuum_subtracted_spectra(parameterfile):
 	hdul = fits.HDUList([primary_hdu,
 								contsub_cube_hdu,noise_cube_hdu])
 	print("Saving continuum-subtracted cube")
-	hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/contsub_cube.fits",overwrite=True)
+	hdul.writeto(f"{parameters['output_dir']}/contsub_cube.fits",overwrite=True)
 	print("Saved")
 
 
@@ -3147,16 +3188,15 @@ def make_continuum_subtracted_spectra(parameterfile):
 	# hdul = fits.HDUList([primary_hdu,
 	# 							linefree_cube_hdu])
 	# print("Saving linefree cube")
-	# hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/linefree_cube.fits",overwrite=True)
+	# hdul.writeto(f"{parameters['output_dir']}/linefree_cube.fits",overwrite=True)
 	# print("Saved")
 	
-
 def check_continuum_at_emissionlines(parameters):
 	
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['output_dir']}/spaxel_properties.fits")
 	bright_spectra = np.argsort(spax_properties['spax_signal_cont']/spax_properties['spax_noise_cont'])[::-1][0:5]
 
-	spectra_file = f"{parameters['output']}/{parameters['output_dir']}/logRebin_spectra.fits"
+	spectra_file = f"{parameters['output_dir']}/logRebin_spectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
 	linLambda = np.exp(logLambda)
@@ -3164,7 +3204,7 @@ def check_continuum_at_emissionlines(parameters):
 	spectra = spectra[0]
 	spectra = spectra[:,bright_spectra]
 
-	continuum_spectra_file = f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_spectra.fits"
+	continuum_spectra_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
 	hdul = fits.open(continuum_spectra_file)
 	logLambda, continuum_spectra = read_spectra_hdul(hdul)
 	hdul.close()
@@ -3250,15 +3290,14 @@ def check_continuum_at_emissionlines(parameters):
 	fig2.tight_layout()
 
 	# plt.show()
-	fig1.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/absline_check.pdf")
-	fig2.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/emline_check.pdf")
-
+	fig1.savefig(f"{parameters['output_dir']}/figures/absline_check.pdf")
+	fig2.savefig(f"{parameters['output_dir']}/figures/emline_check.pdf")
 
 def check_contsub_emlines(parameters):
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['output_dir']}/spaxel_properties.fits")
 	bright_spectra = np.argsort(spax_properties['spax_signal_cont']/spax_properties['spax_noise_cont'])[::-1][0:5]
 
-	spectra_file = f"{parameters['output']}/{parameters['output_dir']}/logRebin_contsub_spectra.fits"
+	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
 	linLambda = np.exp(logLambda)
@@ -3266,7 +3305,7 @@ def check_contsub_emlines(parameters):
 	spectra = spectra[0]
 	spectra = spectra[:,bright_spectra]
 
-	# continuum_spectra_file = f"{parameters['output']}/{parameters['output_dir']}/bestfit_continuum_spectra.fits"
+	# continuum_spectra_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
 	# hdul = fits.open(continuum_spectra_file)
 	# logLambda, continuum_spectra = read_spectra_hdul(hdul)
 	# hdul.close()
@@ -3352,12 +3391,11 @@ def check_contsub_emlines(parameters):
 	fig1.tight_layout()
 
 	# plt.show()
-	fig1.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/contsub_spectra_check.pdf")
-	# fig2.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/emline_check.pdf")
-
+	fig1.savefig(f"{parameters['output_dir']}/figures/contsub_spectra_check.pdf")
+	# fig2.savefig(f"{parameters['output_dir']}/figures/emline_check.pdf")
 
 def find_signal_free_spaxels(parameters):
-	spectra_file = f"{parameters['output']}/{parameters['output_dir']}/logRebin_contsub_spectra.fits"
+	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
 	linLambda = np.exp(logLambda)
@@ -3420,7 +3458,7 @@ def find_signal_free_spaxels(parameters):
 	plt.plot(linLambda,sigmas)
 	plt.show()
 
-	np.savetxt(f"{parameters['output']}/{parameters['output_dir']}/wavelength_sigma.txt",np.vstack([logLambda,sigmas]).T)
+	np.savetxt(f"{parameters['output_dir']}/wavelength_sigma.txt",np.vstack([logLambda,sigmas]).T)
 
 
 	# for ii in range(len(lowsig))[::-1]:
@@ -3433,23 +3471,22 @@ def find_signal_free_spaxels(parameters):
 	# exit()
 	
 	
-
 def make_line_subcubes(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 	Nx = spax_properties.meta['NX']
 	Ny = spax_properties.meta['NY']
 
-	# sigmas =  np.loadtxt(f"{parameters['output']}/{parameters['output_dir']}/wavelength_sigma.txt")
+	# sigmas =  np.loadtxt(f"{parameters['output_dir']}/wavelength_sigma.txt")
 	# sigmaLambda =  sigmas[:,1]
 
-	spectra_file = f"{parameters['output']}/{parameters['output_dir']}/logRebin_contsub_spectra.fits"
+	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
 
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
-	logLambda = np.exp(logLambda)
+	# logLambda = np.exp(logLambda)
 	linLambda = np.exp(logLambda)
 	hdul.close()
 	contsub_spectra = spectra[0]
@@ -3486,7 +3523,7 @@ def make_line_subcubes(parameterfile):
 			line_shifts[ii] = line_shift
 
 
-	print(line_shifts)
+	# print(line_shifts)
 	# exit()
 
 
@@ -3497,7 +3534,7 @@ def make_line_subcubes(parameterfile):
 
 
 	lines = {'Hbeta':{	'lambda':[4861.333]			},
-			'OIII4958':{	'lambda':[4958.911]	}, 
+			'OIII4959':{	'lambda':[4958.911]	}, 
 			'OIII5006':{	'lambda':[5006.843]	}, 
 			# 'HeI5876':{	'lambda':[5875.624]			}, 
 			# 'OI6300':{		'lambda':[6300.304]	},
@@ -3518,8 +3555,8 @@ def make_line_subcubes(parameterfile):
 			
 	# lines = {'OI6300':{		'lambda':[6300.304]	}}
 
-	if not os.path.isdir(f"{parameters['output']}/{parameters['output_dir']}/linecubes"):
-		os.mkdir(f"{parameters['output']}/{parameters['output_dir']}/linecubes")
+	if not os.path.isdir(f"{parameters['output_dir']}/linecubes"):
+		os.mkdir(f"{parameters['output_dir']}/linecubes")
 
 	subcube_width = 1000 / c
 	for ll, line in enumerate(lines):
@@ -3549,21 +3586,21 @@ def make_line_subcubes(parameterfile):
 					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
 									logLambda_subcube  < line_max_logLambda)
 					subcube_spectra[~logLambda_window,ii] = 0
-					subcube_noise[~logLambda_window,ii] = 0
+					# subcube_noise[~logLambda_window,ii] = 0
 				elif line == "NII6548":	
 					line_min_logLambda = np.min(logLambda_subcube)
 					line_max_logLambda = np.log(0.5*(lineLambda + 6562.819)) + line_shift
 					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
 									logLambda_subcube  < line_max_logLambda)
 					subcube_spectra[~logLambda_window,ii] = 0
-					subcube_noise[~logLambda_window,ii] = 0
+					# subcube_noise[~logLambda_window,ii] = 0
 				elif line == "NII6583":	
 					line_min_logLambda = np.log(0.5*(lineLambda + 6562.819)) + line_shift
 					line_max_logLambda = np.max(logLambda_subcube)
 					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
 									logLambda_subcube  < line_max_logLambda)
 					subcube_spectra[~logLambda_window,ii] = 0
-					subcube_noise[~logLambda_window,ii] = 0
+					# subcube_noise[~logLambda_window,ii] = 0
 
 				elif line == "SII6716":	
 					line_min_logLambda = np.min(logLambda_subcube)
@@ -3571,14 +3608,14 @@ def make_line_subcubes(parameterfile):
 					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
 									logLambda_subcube  < line_max_logLambda)
 					subcube_spectra[~logLambda_window,ii] = 0
-					subcube_noise[~logLambda_window,ii] = 0
+					# subcube_noise[~logLambda_window,ii] = 0
 				elif line == "SII6730":	
 					line_min_logLambda = np.log(0.5*(lineLambda + 6716.440)) + line_shift
 					line_max_logLambda = np.max(logLambda_subcube)
 					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
 									logLambda_subcube  < line_max_logLambda)
 					subcube_spectra[~logLambda_window,ii] = 0
-					subcube_noise[~logLambda_window,ii] = 0
+					# subcube_noise[~logLambda_window,ii] = 0
 				
 				
 				subcube_spectra_SN = subcube_spectra[:,ii] / subcube_noise[:,ii]
@@ -3619,7 +3656,7 @@ def make_line_subcubes(parameterfile):
 						mask_final[seg] = 1
 
 				subcube_spectra[:,ii] *= mask_final
-				subcube_noise[:,ii] *= mask_final
+				# subcube_noise[:,ii] *= mask_final
 
 				# subcube_spectra[:,ii][subcube_spectra[:,ii] < 3.*subcube_noise] = 0
 				# plt.plot(np.exp(logLambda_subcube),subcube_spectra[:,ii])
@@ -3627,11 +3664,10 @@ def make_line_subcubes(parameterfile):
 				# plt.plot(np.exp(logLambda_subcube),mask2*np.max(subcube_spectra[:,ii]),ls=':')
 				# plt.plot(np.exp(logLambda_subcube),mask_final*np.max(subcube_spectra[:,ii]),ls='--')
 				# plt.show()
+				# exit()
 			else:
 				subcube_spectra[:,ii] = 0
-				subcube_noise[:,ii] = 0
-
-
+				# subcube_noise[:,ii] = 0
 
 
 
@@ -3657,7 +3693,7 @@ def make_line_subcubes(parameterfile):
 		hdul = fits.HDUList([primary_hdu,
 								spectra_hdu,sigma_hdu])
 		print(f"Saving {line} spectra table")
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/linecubes/{line}_subspectra.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/linecubes/{line}_subspectra.fits",overwrite=True)
 		print("Saved")
 		
 
@@ -3680,6 +3716,9 @@ def make_line_subcubes(parameterfile):
 
 		subcube_cube = subcube_cube.reshape(Nl,Ny,Nx)
 
+		# plt.imshow(np.nansum(subcube_cube,axis=0))
+		# plt.show()
+
 		primary_hdu = fits.PrimaryHDU(header = fits.Header())
 		line_cube_hdu = fits.ImageHDU(subcube_cube,
 								name=line,
@@ -3687,19 +3726,19 @@ def make_line_subcubes(parameterfile):
 		hdul = fits.HDUList([primary_hdu,
 									line_cube_hdu])
 		print(f"Saving {line} linecube")
-		hdul.writeto(f"{parameters['output']}/{parameters['output_dir']}/linecubes/{line}_linecube.fits",overwrite=True)
+		hdul.writeto(f"{parameters['output_dir']}/linecubes/{line}_linecube.fits",overwrite=True)
 		print("Saved")
 
 def measure_line_fluxes(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	# sigmas =  np.loadtxt(f"{parameters['output']}/{parameters['output_dir']}/wavelength_sigma.txt")
+	# sigmas =  np.loadtxt(f"{parameters['output_dir']}/wavelength_sigma.txt")
 	# sigmaLambda =  sigmas[:,1]
 
-	subspectra = glob.glob(f"{parameters['output']}/{parameters['output_dir']}/linecubes/*_subspectra.fits")
+	subspectra = glob.glob(f"{parameters['output_dir']}/linecubes/*_subspectra.fits")
 
 	RV = 4
 	k_l = lambda ll: extinction_curve(ll,RV=RV,extcurve='Calzetti00')
@@ -3708,8 +3747,8 @@ def measure_line_fluxes(parameterfile):
 	if any(['Halpha' in file for file in subspectra]) & any(['Hbeta' in file for file in subspectra]):
 		AV_flag = True
 	
-		Halpha_filename = f"{parameters['output']}/{parameters['output_dir']}/linecubes/Halpha_subspectra.fits"
-		Hbeta_filename = f"{parameters['output']}/{parameters['output_dir']}/linecubes/Hbeta_subspectra.fits"
+		Halpha_filename = f"{parameters['output_dir']}/linecubes/Halpha_subspectra.fits"
+		Hbeta_filename = f"{parameters['output_dir']}/linecubes/Hbeta_subspectra.fits"
 
 		F_Ha, names_Ha = measure_linecube_fluxes(Halpha_filename)
 		F_Hb, names_Hb = measure_linecube_fluxes(Hbeta_filename)
@@ -3728,15 +3767,14 @@ def measure_line_fluxes(parameterfile):
 		EBV_l = 0
 		
 
-
 	names = []
 	F_measures = []
-
 
 	for subspectra_file in subspectra:
 
 		fluxes, line_names = measure_linecube_fluxes(subspectra_file,EBV= EBV_l,k_l = k_l)
-			
+		
+
 		names.extend(line_names)
 		F_measures.extend(fluxes)
 
@@ -3748,13 +3786,9 @@ def measure_line_fluxes(parameterfile):
 	else:
 		reddening = np.full([2,len(F_measures)],np.array([EBV_l,Av])).T
 
-	# print(reddening)
 
 	F_measures = np.hstack((reddening,F_measures))
 	names = ['EBV_l',"A_V"] + names
-
-	# print(spax_properties.info)
-	# exit()
 
 	F_measures_expanded = np.zeros([len(spax_properties),F_measures.shape[1]])
 
@@ -3767,11 +3801,12 @@ def measure_line_fluxes(parameterfile):
 
 
 	fluxes_table = Table(F_measures_expanded,names=names)
-	print(fluxes_table)
+	# print(fluxes_table)
 	# exit()
 
 
-	fluxes_table.write(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits",overwrite=True)
+	fluxes_table.write(f"{parameters['output_dir']}/spax_emline_fluxes.fits",overwrite=True)
+
 def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 
 	if isinstance(k_l,type(None)):
@@ -3781,7 +3816,7 @@ def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 	hdul = fits.open(filename)
 	logLambda, spectra_list = read_spectra_hdul(hdul)
 	spectra = spectra_list[0]
-	noise = np.sqrt(spectra_list[1])
+	noise = spectra_list[1]
 	hdul.close()
 
 	line = filename.split('/')[-1].split('_subspectra')[0]
@@ -3808,11 +3843,8 @@ def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 		spectrum = spectra[:,ii]
 		sigma = noise[:,ii]
 
-		# print(spectrum)
+		spectrum_mask = spectrum > 0
 
-		# plt.plot(spectrum)
-		# plt.show()
-		# exit()
 		if isinstance(EBV,int):
 			E_BV = EBV
 		else:
@@ -3820,13 +3852,40 @@ def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 
 
 		Fint[ii] = np.nansum(spectrum*diff_lambda)
-		Ferr[ii] = np.nansum(sigma*diff_lambda)
+		Ferr[ii] = np.nansum((sigma*spectrum_mask)*diff_lambda)
+
+		if Fint[ii] == 0:				#set non-detection to 1 sigma assuming a 3 channel line
+			Fint[ii] = -99
+			# 3 closest channel to rest wavelength of line
+			loc = np.sort(np.argsort(np.abs(linLambda-emlines_indiv[line]['lambda'][0]))[0:6])+1
+			Ferr[ii] = np.nansum(sigma[loc]*diff_lambda[loc])
+			# plt.plot(linLambda,spectrum)
+			# plt.plot(linLambda,sigma)
+			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(sigma[loc])),
+									# np.zeros_like(linLambda[loc]),
+									# color='Black',alpha=0.2)
+			# plt.show()
+			# exit()
+
+		# else:
+			# print(len(spectrum[spectrum>0]))
+			# loc = np.sort(np.argsort(np.abs(linLambda-emlines[line]['lambda'][0]))[0:6])+1
+			# plt.plot(linLambda,spectrum)
+
+			# plt.plot(linLambda,sigma)
+			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(spectrum[loc])),
+									# np.zeros_like(linLambda[loc]),color='Black',alpha=0.2)
+
+			# plt.show()
+
+			# exit()
+
 
 		spectrum_extcorr = spectrum * np.power(10,0.4*E_BV*k_l(linLambda))
 		sigma_extcorr = sigma * np.power(10,0.4*E_BV*k_l(linLambda))
 
 		Fint_extcorr[ii] = np.nansum(spectrum_extcorr*diff_lambda)
-		Ferr_extcorr[ii] = np.nansum(sigma_extcorr*diff_lambda)
+		Ferr_extcorr[ii] = np.nansum((sigma_extcorr*spectrum_mask)*diff_lambda)
 	
 	fluxes = [Fint,Ferr,Fint_extcorr,Ferr_extcorr]
 
@@ -3875,12 +3934,78 @@ def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 	# plt.fill_between(xx, y1=plt.gca().get_ylim()[1],alpha=0.5,color='Black')
 	# plt.show()
 
+def measure_linecube_kinematics(filename):
+
+	hdul = fits.open(filename)
+	logLambda, spectra_list = read_spectra_hdul(hdul)
+	spectra = spectra_list[0]
+	noise = spectra_list[1]
+	hdul.close()
+
+	line = filename.split('/')[-1].split('_subspectra')[0]
+	names = [f"V_{line}",f"sigma_{line}"]
+
+	linLambda = np.exp(logLambda)
+
+
+	V = np.zeros([spectra.shape[1]])
+	sigma = np.zeros([spectra.shape[1]])
+
+	for ii in range(spectra.shape[1]):
+		spectrum = spectra[:,ii]
+		sigma = noise[:,ii]
+
+		spectrum_mask = spectrum > 0
+
+		V = np.moment(linLambda)
+
+
+		Fint[ii] = np.nansum(spectrum*diff_lambda)
+		Ferr[ii] = np.nansum((sigma*spectrum_mask)*diff_lambda)
+
+		if Fint[ii] == 0:				#set non-detection to 1 sigma assuming a 3 channel line
+			Fint[ii] = -99
+			# 3 closest channel to rest wavelength of line
+			loc = np.sort(np.argsort(np.abs(linLambda-emlines_indiv[line]['lambda'][0]))[0:6])+1
+			Ferr[ii] = np.nansum(sigma[loc]*diff_lambda[loc])
+			# plt.plot(linLambda,spectrum)
+			# plt.plot(linLambda,sigma)
+			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(sigma[loc])),
+									# np.zeros_like(linLambda[loc]),
+									# color='Black',alpha=0.2)
+			# plt.show()
+			# exit()
+
+		# else:
+			# print(len(spectrum[spectrum>0]))
+			# loc = np.sort(np.argsort(np.abs(linLambda-emlines[line]['lambda'][0]))[0:6])+1
+			# plt.plot(linLambda,spectrum)
+
+			# plt.plot(linLambda,sigma)
+			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(spectrum[loc])),
+									# np.zeros_like(linLambda[loc]),color='Black',alpha=0.2)
+
+			# plt.show()
+
+			# exit()
+
+
+		spectrum_extcorr = spectrum * np.power(10,0.4*E_BV*k_l(linLambda))
+		sigma_extcorr = sigma * np.power(10,0.4*E_BV*k_l(linLambda))
+
+		Fint_extcorr[ii] = np.nansum(spectrum_extcorr*diff_lambda)
+		Ferr_extcorr[ii] = np.nansum((sigma_extcorr*spectrum_mask)*diff_lambda)
+	
+	fluxes = [Fint,Ferr,Fint_extcorr,Ferr_extcorr]
+
+	return  fluxes, names
+
 def check_line_ratios(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	fig = plt.figure(figsize=(20,10))
 	gs = gridspec.GridSpec(4,1,hspace=0)
@@ -4031,15 +4156,15 @@ def check_line_ratios(parameterfile):
 			Line2D([0],[0],color='White',marker='o',markerfacecolor='Red')]
 	ax1.legend(legs,["All","SN>3","SN>5"],fontsize=15)
 
-	fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/EMline_ratios.png")
+	fig.savefig(f"{parameters['output_dir']}/figures/EMline_ratios.png")
 
 	# plt.show()
 def check_line_SNmaps(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	spax_properties = hstack((spax_properties,emline_fluxes))
 
@@ -4087,7 +4212,7 @@ def check_line_SNmaps(parameterfile):
 		ax1.set_ylabel("pix",fontsize=15)
 		ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 
-		fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/{line}_linemap.png")
+		fig.savefig(f"{parameters['output_dir']}/figures/{line}_linemap.png")
 
 		if f"{line}_err" in emline_fluxes.keys():
 
@@ -4114,7 +4239,7 @@ def check_line_SNmaps(parameterfile):
 			ax1.set_ylabel("pix",fontsize=15)
 			ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 
-			fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/{line}_SNmap.png")
+			fig.savefig(f"{parameters['output_dir']}/figures/{line}_SNmap.png")
 			
 
 
@@ -4122,9 +4247,9 @@ def check_line_SNmaps(parameterfile):
 def line_ratio_maps(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	spax_properties = hstack((spax_properties,emline_fluxes))
 
@@ -4216,7 +4341,7 @@ def line_ratio_maps(parameterfile):
 		ax1.set_ylabel("pix",fontsize=15)
 		ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 
-		fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/{pair[0]}_{pair[1]}_ratio_map.png")
+		fig.savefig(f"{parameters['output_dir']}/figures/{pair[0]}_{pair[1]}_ratio_map.png")
 		# plt.show()
 
 		if pair == ['Halpha','Hbeta']:
@@ -4260,7 +4385,7 @@ def line_ratio_maps(parameterfile):
 			ax1.set_xlabel("pix",fontsize=15)
 			ax1.set_ylabel("pix",fontsize=15)
 			ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
-			fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/AV_map.png")
+			fig.savefig(f"{parameters['output_dir']}/figures/AV_map.png")
 
 
 def metallicity_Curti17(parameterfile,method='O3N2'):	
@@ -4282,9 +4407,9 @@ def metallicity_Curti17(parameterfile,method='O3N2'):
 
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	spax_properties = hstack((spax_properties,emline_fluxes))
 
@@ -4422,15 +4547,15 @@ def metallicity_Curti17(parameterfile,method='O3N2'):
 	ax1.set_ylabel("pix",fontsize=15)
 	ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 
-	fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/logOH_map_{method}.png")
+	fig.savefig(f"{parameters['output_dir']}/figures/logOH_map_{method}.png")
 	# plt.show()
 def metallicity_Dopita16(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	spax_properties = hstack((spax_properties,emline_fluxes))
 
@@ -4498,16 +4623,16 @@ def metallicity_Dopita16(parameterfile):
 	ax1.set_ylabel("pix",fontsize=15)
 	ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 
-	fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/logOH_map_Dopita16.png")
+	fig.savefig(f"{parameters['output_dir']}/figures/logOH_map_Dopita16.png")
 	# plt.show()
 
 
 def make_BPT_diagram(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 
-	spax_properties = Table.read(f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits")
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	emline_fluxes = Table.read(f"{parameters['output']}/{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
 
 	spax_properties = hstack((spax_properties,emline_fluxes))
 
@@ -4574,7 +4699,7 @@ def make_BPT_diagram(parameterfile):
 	BPT_ax1.set_ylim([-1.,1.])
 	BPT_ax2.set_ylim(BPT_ax1.get_ylim())
 
-	fig.savefig(f"{parameters['output']}/{parameters['output_dir']}/figures/BPTs.png")
+	fig.savefig(f"{parameters['output_dir']}/figures/BPTs.png")
 	# plt.show()
 
 
@@ -4583,7 +4708,7 @@ def fit_O3_line_components(parameterfile):
 	parameters =  read_parameterfile(parameterfile)
 
 
-	spectra_file = f"{parameters['output']}/{parameters['input_dir']}/linecubes/OIII5006_subspectra.fits"
+	spectra_file = f"{parameters['input_dir']}/linecubes/OIII5006_subspectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda_spec, spectra  = read_spectra_hdul(hdul)
 	logRebin_spectra = spectra[0]
@@ -4750,14 +4875,14 @@ def create_spectrum_from_weights(parameterfile, weights, templates):
 
 		parameters = read_parameterfile(parameterfile)
 		
-		spax_properties_file = f"{parameters['output']}/{parameters['input_dir']}/spaxel_properties.fits"
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 
 		spax_properties = Table.read(spax_properties_file)
 		# print(spax_properties)
 		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
 		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
 
-		spectra_file = f"{parameters['output']}/{parameters['input_dir']}/logRebin_spectra.fits"
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 
 		hdul = fits.open(spectra_file)
