@@ -1,4 +1,4 @@
-name: pPXFenv3
+name: pPXFenv
 channels: 
 - conda-forge
 - defaults
@@ -12,7 +12,8 @@ dependencies:
   - openmpi
   - pandas
   - spectral-cube
-  # - pip
-#pip: 
- #- vorbin
- #- ppxf
+  - pip
+  - pip:
+    - vorbin
+    - ppxf
+
