@@ -6,21 +6,25 @@ from matplotlib.lines import Line2D
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 from astropy.table import Table, hstack
+from astropy.stats import sigma_clip
+import astropy.constants as ac
+
 from scipy import stats
+from scipy.interpolate import CubicSpline
+from scipy.optimize import curve_fit
 import resource
 import copy
+import time
 
-from scipy import ndimage
 
 try:
 	from mpi4py import MPI
 except:
 	print('mpi4py not found')
+	exit()
 
-# from guppy import hpy
 import glob
 import sys, os
-# import pandas as pd
 from astropy.io import fits
 
 try:
@@ -28,13 +32,11 @@ try:
 	import ppxf.ppxf_util as pputils
 except:
 	print('No pPXF!')
+	exit()
 
 home_dir = os.path.expanduser('~')
 sys.path.append(f'{home_dir}/Research/programs/astro-functions')
 import astro_functions as astrofunc
-
-from spectral_cube import SpectralCube
-
 
 # import modified vorbin
 from modified_voronoi_2d_binning import mod_voronoi_2d_binning as mv2db
@@ -42,7 +44,7 @@ from vorbin.voronoi_2d_binning import voronoi_2d_binning
 
 
 #global variables
-c = 299792.458
+c = 1.e-3*ac.c.value	#km/s
 
 emlines = {		'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				'Halpha':{	'lambda':[6562.819],			'ratio':[1]},
@@ -61,7 +63,6 @@ emlines = {		'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				# 'Pa20':{	'lambda':[8392.397],			'ratio':[1]},
 
 
-
 				'OI':{		'lambda':[6300.304,6363.78],	'ratio':[1,0.33]},					#low ionisation 14.53
 				'OI8446': {	'lambda':[8446.359],			'ratio':[1]},
 				'OII':{		'lambda':[7319.990, 7330.730],	'ratio':[1,1]}, #?? check 			#low ionisation 13.62
@@ -70,6 +71,9 @@ emlines = {		'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				'NI':{ 		'lambda':[5200.257],			'ratio':[1]},
 			 	'NII':{		'lambda':[6548.050,6583.460],	'ratio':[0.34,1]},					#low ionisation 15.43
 
+
+			 	'Fe4993':{	'lambda':[4993.358],			'ratio':[1]},
+			 	'Fe5018':{	'lambda':[5018.440],			'ratio':[1]},
 			 	
 				'HeI5876':{	'lambda':[5875.624],			'ratio':[1]}, 
 				'HeI6678':{	'lambda':[6678.151],			'ratio':[1]}, 
@@ -114,6 +118,8 @@ emlines_indiv = {'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 			 	'NII6548':{		'lambda':[6548.050],	'ratio':[1]},					#low ionisation 15.43
 			 	'NII6583':{		'lambda':[6583.460],	'ratio':[1]},					#low ionisation 15.43
 
+			 	'Fe4993':{	'lambda':[4993.358],			'ratio':[1]},
+			 	'Fe5018':{	'lambda':[5018.440],			'ratio':[1]},
 			 	
 				'HeI5876':{	'lambda':[5875.624],			'ratio':[1]}, 
 				'HeI6678':{	'lambda':[6678.151],			'ratio':[1]}, 
@@ -129,9 +135,16 @@ emlines_indiv = {'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
 				'ArIV4711':{	'lambda':[4711.260],			'ratio':[1]}, 						#high ionisation 40.74 #doublet**
 				'ArIV4740':{	'lambda':[4740.120],			'ratio':[1]},						#high ionisation 40.74
 				}
-###program callers
-def run():
 
+
+###Main program callers
+
+def run():
+	"""
+	The main running function. Reads the provided parameter file and runs the desired modules
+	"""
+
+	#Get parameters from the command line
 	parameterfile = sys.argv[1]
 	parameters = read_parameterfile(parameterfile)
 
@@ -144,85 +157,82 @@ def run():
 		elif parameters['vorbin_type'] == 'sub':
 			voronoi_subbin_cube(parameterfile)
 
-
-	if parameters['run_stelkin'] or parameters['run_continuum']:
+	if parameters['run_fit']:
 		parallel_pPXF_fit(parameterfile)
 
 
-def pPXF_caller(templates, parameters):
-	
-	spectrum = parameters['spectrum']
-	noise = parameters['noise']
-	spec_median = np.abs(np.nanmedian(spectrum))
-	spectrum = spectrum / spec_median			#nomalise spectrum
+	if parameters['stelkin_outputs']:
+		
+		comm = MPI.COMM_WORLD
+		rank = comm.Get_rank()
+		nproc = comm.Get_size()
 
-	good_pixels_spec = parameters['good_pixels']
-	good_pixels_spec[np.isfinite(spectrum)==False] = False
-	good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
+		if rank == 0:
+			print("Making stellar kinematics maps")
+			sys.stdout.flush()
+			make_stelkin_map(parameters)
+		
+	if parameters['continuum_outputs']:
+		
+		comm = MPI.COMM_WORLD
+		rank = comm.Get_rank()
+		nproc = comm.Get_size()
 
-	noise[~good_pixels_spec] = 1.e10	
+		if rank == 0:
+			make_continuum_subtracted_spectra(parameterfile)
+			make_line_subcubes(parameterfile)
+			measure_linecubes(parameterfile)
+			make_linecube_fluxmaps(parameterfile)
+			make_linecube_kinmaps(parameterfile)
 
+	if parameters['binned_contsub']:
+		comm = MPI.COMM_WORLD
+		rank = comm.Get_rank()
+		nproc = comm.Get_size()
 
-	out = ppxf(		templates,
-					spectrum, 
-					noise,
-					parameters['galaxy_velscale'],
-					parameters['proc_start'],
-			moments = parameters['proc_moments'],
-			component = parameters['components'],
-			gas_component = parameters['gas_components'],
-			constr_kinem = parameters['proc_constr_kinem'],
-			degree = parameters['degree'],
-			mdegree = parameters['mdegree'],
-			velscale_ratio = parameters['velscale_ratio'],
-			vsyst = parameters['dv'],
-			goodpixels = np.arange(len(spectrum))[good_pixels_spec],
-			plot = True,
-			# clean=True,
-			quiet=False)
-	plt.show()
-	# exit()
-
-	bestfit_spectrum = out.bestfit*spec_median
-
-	if isinstance(parameters['gas_components'],type(None)):
-		bestfit_gas = np.zeros_like(bestfit_spectrum)
-		gas_flux = []
-		gas_flux_error = []
-	else:
-		gas_flux = out.gas_flux
-		gas_flux_error = out.gas_flux_error
-		bestfit_gas = out.gas_bestfit*spec_median
-
-	bestfit_stars = bestfit_spectrum - bestfit_gas
-	
-	output = [out.chi2,out.sol,out.error,
-					gas_flux,gas_flux_error,
-					bestfit_stars,bestfit_gas,
-					out.weights,out.apoly,out.mpoly]
-	return output
+		if rank == 0:
+			make_line_subcubes(parameterfile)
+			measure_linecubes(parameterfile)
+			make_linecube_fluxmaps(parameterfile)
+			make_linecube_kinmaps(parameterfile)
 
 def parallel_pPXF_fit(parameterfile):
+	"""
+	The main workhorse, reads spectra, templates, and fits using MPI for parallelisation
 
-	comm = MPI.COMM_WORLD
+	Parameters
+	----------
+	parameterfile : dict
+		Dictionary containing fit inputs and parameters
+
+	Returns
+	-------
+	Nothing
+		Pixel table is updated with fit params and spectra are written to file
+	"""
+	
+	comm = MPI.COMM_WORLD								#MPI set up
 	rank = comm.Get_rank()
 	nproc = comm.Get_size()
 
+	#Head node reads spectra and templates
 	if rank == 0:
+		startTimeRun = time.time()
 		print(f"Running with {nproc} processors")
 		print("Preparing inputs")
 		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
 		
+		#Get spectra and templates
+		parameters = read_parameterfile(parameterfile)							
 		spax_properties = get_bin_properties(parameters)
 		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
 		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
 		logLambda_spec, logRebin_spectra, logRebin_noise = get_spectra_to_fit(parameters)
-
 		logLambda_templates, templates, components, gas_components = get_templates(parameters)
 
-		#truncate to fit range
-		if 'fit_lrange' in parameters.keys():
+		print(f"The velscale of the data being fit is {parameters['galaxy_velscale']:.2f}")
+
+		if 'fit_lrange' in parameters.keys():			#Truncate spectra to fit range
 			Lmin = parameters['fit_lrange'][0]
 			Lmax = parameters['fit_lrange'][1]
 			specrange = np.where((logLambda_spec>=np.log(Lmin)) & 
@@ -231,15 +241,16 @@ def parallel_pPXF_fit(parameterfile):
 			logRebin_spectra = logRebin_spectra[specrange,:]
 			logRebin_noise = logRebin_noise[specrange,:]
 
-			specrange = np.where((logLambda_templates>=np.log(Lmin*0.9)) & 
-									(logLambda_templates<=np.log(Lmax*1.1)))[0]
+			specrange = np.where((logLambda_templates>=np.log(Lmin - 25)) & 
+									(logLambda_templates<=np.log(Lmax + 25)))[0]
 			logLambda_templates = logLambda_templates[specrange]
 			templates = templates[specrange,:]
 
+		#Mask sky lines and bad pixels
 		good_pixels = create_spectrum_mask(logLambda_spec,parameters)
 
+		#Get kinematic inputs and constraints
 		start, moments, constr_kinem = get_constraints(parameters,spax_properties,vorbin_nums)
-
 		dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
 
 		parameters['components'] = components
@@ -247,318 +258,93 @@ def parallel_pPXF_fit(parameterfile):
 		parameters['dv'] = dv
 		parameters['good_pixels'] = good_pixels
 
-	else:
-		parameters = None
-		templates = None
-
-	parameters = comm.bcast(parameters,root=0)
-	templates = comm.bcast(templates,root=0)
-	
 	comm.barrier()
 	if rank == 0:
 		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
 	sys.stdout.flush()
-	for nn in range(1,nproc):
+	for nn in range(1,nproc):												#Distribute spectra, templates, and parameters to nodes
 		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			proc_vorbin_nums = vorbin_nums[proc_spax]
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-			proc_start = [start[pp] for pp in proc_spax]
-			proc_moments = [moments[pp] for pp in proc_spax]
-			proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
-			tosend = [proc_vorbin_nums, #proc_spax_properies,
-						proc_logRebin_spectra,
-						proc_logRebin_noise,
-						proc_start,
-						proc_moments,
-						proc_constr_kinem]
-			comm.send(tosend, dest=nn, tag=100+nn)
+			proc_spec_num = np.arange(nn,len(vorbin_nums),nproc,dtype=int)	#IDs of spectra/noise to send to each node
+			
+			proc_parameters = copy.deepcopy(parameters)
+			proc_parameters['vorbin_nums'] = vorbin_nums[proc_spec_num]
+			proc_parameters['templates'] = templates
+			proc_parameters['logRebin_spectra'] = logRebin_spectra[:,proc_spec_num]
+			proc_parameters['logRebin_noise'] = logRebin_noise[:,proc_spec_num]
+			proc_parameters['start'] = [start[pp] for pp in proc_spec_num]
+			proc_parameters['moments'] = [moments[pp] for pp in proc_spec_num]
+			proc_parameters['constr_kinem'] =[constr_kinem[pp] for pp in proc_spec_num]
+
+			comm.send(proc_parameters, dest=nn, tag=100+nn)				#Send
 			tosend = None
 
 		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			proc_vorbin_nums = torecieve[0]
-			proc_logRebin_spectra = torecieve[1]
-			proc_logRebin_noise = torecieve[2]
-			proc_start = torecieve[3]
-			proc_moments = torecieve[4]
-			proc_constr_kinem = torecieve[5]
+			torecieve = comm.recv(source=0, tag=100+rank)				#Recieve
+			proc_parameters = torecieve
+
 			torecieve = None
+		comm.barrier()
 
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		proc_vorbin_nums = vorbin_nums[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-		proc_start = [start[pp] for pp in proc_spax]
-		proc_moments = [moments[pp] for pp in proc_spax]
-		proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
-
-		parameters['spectra_shape'] = logRebin_spectra.shape
-
-		logRebin_spectra = None
-		logRebin_noise = None
-
-	if rank == 0:
-		print(f"Spectra distributed, running fits")
-	sys.stdout.flush()
-
-	comm.barrier()
-
-	outputs = []
-	outputs_all = []
-	for vb, vorbin_num in enumerate(proc_vorbin_nums):
-
-		spectrum = np.array(proc_logRebin_spectra[:,vb])
-		noise = np.array(proc_logRebin_noise[:,vb])	
-
+	if rank == 0:														#Select head node's spectra
+		proc_spec_num = np.arange(0,len(vorbin_nums),nproc,dtype=int)
 		proc_parameters = copy.deepcopy(parameters)
-		proc_parameters['spectrum'] = spectrum
-		proc_parameters['noise'] = noise
-		proc_parameters['proc_start'] = proc_start[vb]
-		proc_parameters['proc_moments'] = proc_moments[vb]
-		proc_parameters['proc_constr_kinem'] = proc_constr_kinem[vb]
-
-		fit_out = pPXF_caller(templates, proc_parameters)
-
-		outputs.append([vorbin_num] + fit_out)
-
-		if vb%100 == 0 and vb !=0:
-			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*vb/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
-				print(f"Gathering outputs so far")
-				# print(f"-------------------------")
-			sys.stdout.flush()
-
-			outputs = comm.gather(outputs,root=0)
-			if rank == 0:
-				outputs_all.extend(outputs)
-				print(f"Outputs gathered, continuing")
-
-				print(f"-------------------------")
-
-			outputs = []
-			sys.stdout.flush()
-	
-	comm.barrier()
-	if rank == 0:
-		print("pPXF fits finished, gathering last outputs to head node")
-		print(f"-------------------------")	
-		sys.stdout.flush()
-
-	outputs = comm.gather(outputs,root=0)
-	if rank == 0:
-		outputs_all.extend(outputs)
-		outputs_all = [oo for output in outputs_all for oo in output]
-	comm.barrier()
-	
-	#Memory-freeing
-	outputs = None
-	proc_logRebin_spectra = None
-	proc_logRebin_noise = None
-
-
-	if rank == 0:
-		
-		distriute_save_outputs(parameters, spax_properties,logLambda_spec, outputs_all)
-	
-		print("Doing continuum subtraction")
-		sys.stdout.flush()
-		make_continuum_subtracted_spectra(parameterfile)
-		make_line_subcubes(parameterfile)
-		measure_linecubes(parameterfile)
-		make_linecube_fluxmaps(parameterfile)
-		make_linecube_kinmaps(parameterfile)
-
-###
-
-
-#old main fitting functions
-def fit_stellar_kinematics(parameterfile):
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-	if rank == 0:
-		print(f"Running with {nproc} processors")
-		print("Preparing inputs")
-		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
-		
-		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-		spax_properties = Table.read(spax_properties_file)
-		parameters['z'] = spax_properties.meta['Z']
-
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-
-		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-
-		hdul = fits.open(spectra_file)
-		logLambda_spec, spectra  = read_spectra_hdul(hdul)
-		logRebin_spectra = spectra[0]
-		logRebin_noise = spectra[1]
-		spectra = None
-
-		header = hdul[0].header
-		hdul.close()
-		velscale = header['VELSCALE']
-		parameters['galaxy_velscale'] = float(velscale)
-
-		logLambda_templates, templates, components, gas_components = get_templates(parameters)
-
-
-		#truncate to fit range
-		if 'stars_lrange' in parameters.keys():
-			Lmin = parameters['stars_lrange'][0]
-			Lmax = parameters['stars_lrange'][1]
-			specrange = np.where((logLambda_spec>=np.log(Lmin)) & 
-									(logLambda_spec<=np.log(Lmax)))[0]
-			logLambda_spec = logLambda_spec[specrange]
-			logRebin_spectra = logRebin_spectra[specrange,:]
-			logRebin_noise = logRebin_noise[specrange,:]
-
-			specrange = np.where((logLambda_templates>=np.log(Lmin*0.9)) & 
-									(logLambda_templates<=np.log(Lmax*1.1)))[0]
-			logLambda_templates = logLambda_templates[specrange]
-			templates = templates[specrange,:]
-
-
-		good_pixels = create_spectrum_mask(logLambda_spec,parameters)
-
-		start, moments, constr_kinem = get_constraints(parameters,spax_properties,vorbin_nums)
-
-
-		dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-
-	else:
-		parameters = None
-		# start = None
-		# moments = None
-		# constraints = None
-		components = None
-		gas_components = None
-		dv = None
-		templates = None
-		good_pixels = None
-
-	parameters = comm.bcast(parameters,root=0)
-	# start = comm.bcast(start,root=0)
-	# moments = comm.bcast(moments,root=0)
-	components = comm.bcast(components,root=0)
-	gas_components = comm.bcast(gas_components,root=0)
-	dv = comm.bcast(dv,root=0)
-	templates = comm.bcast(templates,root=0)
-	good_pixels = comm.bcast(good_pixels,root=0)
-	
-	comm.barrier()
-	if rank == 0:
-		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-	sys.stdout.flush()
-	for nn in range(1,nproc):
-		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			# proc_spax_properies = spax_properties[proc_spax]
-			proc_vorbin_nums = vorbin_nums[proc_spax]
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-			proc_start = [start[pp] for pp in proc_spax]
-			proc_moments = [moments[pp] for pp in proc_spax]
-			proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
-			tosend = [proc_vorbin_nums, #proc_spax_properies,
-						proc_logRebin_spectra,
-						proc_logRebin_noise,
-						proc_start,
-						proc_moments,
-						proc_constr_kinem]
-			comm.send(tosend, dest=nn, tag=100+nn)
-			tosend = None
-
-		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			# proc_spax_properties = torecieve[0]
-			proc_vorbin_nums = torecieve[0]
-			proc_logRebin_spectra = torecieve[1]
-			proc_logRebin_noise = torecieve[2]
-			proc_start = torecieve[3]
-			proc_moments = torecieve[4]
-			proc_constr_kinem = torecieve[5]
-			torecieve = None
-
-
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		# proc_spax_properties = spax_properties[proc_spax]
-		proc_vorbin_nums = vorbin_nums[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-		proc_start = [start[pp] for pp in proc_spax]
-		proc_moments = [moments[pp] for pp in proc_spax]
-		proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
+		proc_parameters['vorbin_nums'] = vorbin_nums[proc_spec_num]
+		proc_parameters['templates'] = templates
+		proc_parameters['logRebin_spectra'] = logRebin_spectra[:,proc_spec_num]
+		proc_parameters['logRebin_noise'] = logRebin_noise[:,proc_spec_num]
+		proc_parameters['start'] = [start[pp] for pp in proc_spec_num]
+		proc_parameters['moments'] = [moments[pp] for pp in proc_spec_num]
+		proc_parameters['constr_kinem'] =[constr_kinem[pp] for pp in proc_spec_num]
 
 		parameters['spectra_shape'] = logRebin_spectra.shape
+		parameters['templates_shape'] = templates.shape
 
-
-		logRebin_spectra = None
+		logRebin_spectra = None											#Free up memory										
 		logRebin_noise = None
-		hdul = None
 
 	if rank == 0:
 		print(f"Spectra distributed, running fits")
+		outputs_all = []												#To hold all outputs
 	sys.stdout.flush()
-
 	comm.barrier()
 
-	outputs = []
-	outputs_all = []
+	timeStart = time.time()												#Start timer
+	outputs = []														#Hold outputs from each node
+	time_fits = []
+	for vb, vorbin_num in enumerate(proc_parameters['vorbin_nums']):	#Loop over all spectra
+		spectrum = proc_parameters['logRebin_spectra'][:,vb]
+		noise = proc_parameters['logRebin_noise'][:,vb]
+		spec_median = np.abs(np.nanmedian(spectrum))
+		spectrum = spectrum / spec_median								#Nomalise spectrum to avoid numerical problems
 
-	# for ss in range(len(proc_logRebin_spectra[0,:])):
-	for vb, vorbin_num in enumerate(proc_vorbin_nums):
-
-		spectrum = np.array(proc_logRebin_spectra[:,vb])
-		noise = np.array(proc_logRebin_noise[:,vb])
-		good_pixels_spec = copy.deepcopy(good_pixels)
+		good_pixels_spec = proc_parameters['good_pixels']				#Adjust bad pixels for individual spectrum
 		good_pixels_spec[np.isfinite(spectrum)==False] = False
 		good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
+		noise[~good_pixels_spec] = 1									#Propagate bad pixels to noise array
 
-
-		spec_median = np.abs(np.nanmedian(spectrum))
-		spectrum = spectrum / spec_median			#nomalise spectrum
-		# var_median = np.abs(np.nanmedian(noise))
-		# noise = noise / var_median			#nomalise noise
-		noise[~good_pixels_spec] = 1.e10		
-
-		# print(proc_constraints)
-		# exit()
-		# print(proc_start)
-
-
-		out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = proc_start[vb],
-				moments = proc_moments[vb],
-				component = components,
-				gas_component = gas_components,
-				constr_kinem = proc_constr_kinem[vb],
-				degree = parameters['stars_degree'],
-				mdegree = parameters['stars_mdegree'],
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				plot=False,
-				# clean=True,
-				quiet=True)
+		out = ppxf(	proc_parameters['templates'],						#Call fit function
+					spectrum, 
+					noise,
+					proc_parameters['galaxy_velscale'],
+					proc_parameters['start'][vb],
+				moments = proc_parameters['moments'][vb],
+				component = proc_parameters['components'],
+				gas_component = proc_parameters['gas_components'],
+				constr_kinem = proc_parameters['constr_kinem'][vb],
+				degree = proc_parameters['degree'],
+				mdegree = proc_parameters['mdegree'],
+				velscale_ratio = proc_parameters['velscale_ratio'],
+				vsyst = proc_parameters['dv'],
+				goodpixels = np.arange(len(spectrum))[good_pixels_spec],
+				plot = proc_parameters['plot'],
+				quiet = not proc_parameters['plot']
+				)
+		if proc_parameters['plot']:
+			plt.show()
 
 		bestfit_spectrum = out.bestfit*spec_median
 
-		if isinstance(gas_components,type(None)):
+		if isinstance(proc_parameters['gas_components'],type(None)):	#Extract gas emission lines if being fit
 			bestfit_gas = np.zeros_like(bestfit_spectrum)
 			gas_flux = []
 			gas_flux_error = []
@@ -566,20 +352,24 @@ def fit_stellar_kinematics(parameterfile):
 			gas_flux = out.gas_flux
 			gas_flux_error = out.gas_flux_error
 			bestfit_gas = out.gas_bestfit*spec_median
-
 		bestfit_stars = bestfit_spectrum - bestfit_gas
 		
-		outputs.append([vorbin_num, out.chi2,out.sol,out.error,
+		output = [vorbin_num,out.chi2,out.sol,out.error,				
 						gas_flux,gas_flux_error,
 						bestfit_stars,bestfit_gas,
-						out.weights,out.apoly,out.mpoly])
-	
-		if vb%100 == 0 and vb !=0:
+						out.weights,out.apoly,out.mpoly]
+		outputs.append(output)
+
+		if vb%100 == 0 and vb !=0:										#Pause and gather outputs every 100 fits to avoid comm limits
 			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*vb/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
+			sys.stdout.flush()
+
+			if rank == 0:								
+				timeDiff = time.time()-timeStart						#Estimate runtime
+				print(f"Fit is {100*vb/len(proc_parameters['vorbin_nums']):.2f}% through {len(proc_parameters['vorbin_nums'])} spectra")
+				print(f"avg. {timeDiff/(vb+1):.3f}s/spec, "\
+						f"{int(timeDiff/60):.0f}m{timeDiff%60:.1f}s ellapsed / est. {(timeDiff/(vb+1) * (len(proc_parameters['vorbin_nums']))/60):.1f}m total")
 				print(f"Gathering outputs so far")
-				# print(f"-------------------------")
 			sys.stdout.flush()
 
 			outputs = comm.gather(outputs,root=0)
@@ -587,302 +377,16 @@ def fit_stellar_kinematics(parameterfile):
 				outputs_all.extend(outputs)
 				print(f"Outputs gathered, continuing")
 				print(f"-------------------------")
+			outputs = []												#Reset node outputs list
 			sys.stdout.flush()
-			outputs = []
+	comm.barrier()														#Wait for all fits to finish
 
-	
-	comm.barrier()
 	if rank == 0:
 		print("pPXF fits finished, gathering last outputs to head node")
 		print(f"-------------------------")	
 		sys.stdout.flush()
 
-	outputs = comm.gather(outputs,root=0)
-	if rank == 0:
-		outputs_all.extend(outputs)
-		outputs_all = [oo for output in outputs_all for oo in output]
-	comm.barrier()
-
-
-	if rank == 0:
-			
-		moments_list = ['V','sigma','h3','h4','h5','h6']
-		stars_kin_names = [f'{k}_stellar{ee}'  for k in moments_list[:parameters['stars_moments']] for ee in ['','_err']] 
-		gas_kin_names = [f'{k}_gas_C{ii+1}{ee}' for ii in range(len(parameters['gas_Ncomp'])) for k in ['V','sigma'] for ee in ['','_err']]
-		gas_flux_names = [f'{ll}_flux{ee}' for ll in parameters['gas_names'] for ee in ['','err']]
-
-		names = ['chi2'] + stars_kin_names + gas_kin_names + gas_flux_names		 
-
-
-		kin_fluxes = np.full([len(spax_properties),len(names)],np.nan)
-
-		bestfit_stars = np.zeros(parameters['spectra_shape'])
-		bestfit_gas = np.zeros(parameters['spectra_shape'])
-		template_weights = np.empty((templates.shape[1],parameters['spectra_shape'][1]))
-		apy = np.empty(parameters['spectra_shape'])
-		mpy = np.empty(parameters['spectra_shape'])
-
-		# for k in ['V','sigma','h3','h4']:
-			# spax_properties[f'{k}_stellar'] = np.full(len(spax_properties['spax_num'][:]), -9999.)
-		
-		for out in outputs_all:
-			vorbin_num = out[0]
-			chi2 = out[1]
-			kin = np.hstack(out[2])
-			err = np.hstack(out[3])*np.sqrt(chi2)
-			if isinstance(gas_components,type(None)):
-				gas_flux =  np.array([])
-				gas_flux_err =  np.array([])
-			else:
-				gas_flux = out[4]
-				gas_flux_err = out[5]*np.sqrt(chi2)
-
-
-
-			kin_err = np.full(1+len(kin)+len(err),None)
-			kin_err[0] = chi2
-			kin_err[1::2] = kin
-			kin_err[2::2] = err
-
-			flux_err = np.full(len(gas_flux)+len(gas_flux_error),None)
-			flux_err[::2] = gas_flux
-			flux_err[1::2] = gas_flux_err
-
-
-
-			ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0]
-			kin_fluxes[ref,:] = np.hstack((kin_err,flux_err))
-			# print(out[2])
-			bestfit_stars[:,vorbin_num] = np.array(out[6])
-			bestfit_gas[:,vorbin_num] = np.array(out[7])
-			# for v,k in enumerate(['V','sigma','h3','h4']):
-					# spax_properties[f'{k}_stellar'][ref] = fit.sol[v]
-
-
-			template_weights[:,vorbin_num] = out[8]
-			apy[:,vorbin_num] = out[9]
-			mpy[:,vorbin_num] = out[10]
-
-		
-		if not os.path.isdir(f"{parameters['output_dir']}"):
-			os.mkdir(f"{parameters['output_dir']}")
-			os.mkdir(f"{parameters['output_dir']}/figures")
-		
-		kin_fluxes = Table(kin_fluxes,names=names)
-		print("Saving bestfit kinematics and fluxes table")
-		sys.stdout.flush()
-		kin_fluxes.write(f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits",overwrite=True)
-		# weights = Table(np.asarray(template_weights),names=
-		# 			('weights','apoly','mpoly'))
-		# print("Saving templates table")
-		# weights.write(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
-		header["COMMENT1"] = "Best fit weights for bins"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		weights_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = template_weights.T,
-								name='weights',format=str(len(template_weights))+'D'
-								)]))
-
-		apoly_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = apy.T,
-								name='apoly',format=str(len(apy))+'D'
-								)]))
-
-		mpoly_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = mpy.T,
-								name='mpoly',format=str(len(mpy))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,weights_hdu,apoly_hdu, mpoly_hdu])		
-		hdul.writeto(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
-
-
-
-		header["COMMENT1"] = "Best fit stellar spectra for bins"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		bestfit_stars_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_stars.T,
-								name='BESTSTARS',format=str(len(bestfit_stars))+'D'
-								)]))
-		bestfit_gas_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_gas.T,
-								name='BESTGAS',format=str(len(bestfit_gas))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,
-							bestfit_stars_hdu,bestfit_gas_hdu])
-		print("Saving best fit spectra table")
-		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output_dir']}/logRebin_bestfit_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-		print("Making stellar kinematics maps")
-		sys.stdout.flush()
-		make_stelkin_map(parameters)
-
-def fit_continuum(parameterfile):
-
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-	if rank == 0:
-		print(f"Running with {nproc} processors")
-		print("Preparing inputs")
-		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
-		
-		spax_properties = get_bin_properties(parameters)
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-
-		logLambda_spec, logRebin_spectra, logRebin_noise = get_spectra_to_fit(parameters)
-
-		logLambda_templates, templates, components, gas_components = get_templates(parameters)
-
-		#truncate to fit range
-		if 'fit_lrange' in parameters.keys():
-			Lmin = parameters['fit_lrange'][0]
-			Lmax = parameters['fit_lrange'][1]
-			specrange = np.where((logLambda_spec>=np.log(Lmin)) & 
-									(logLambda_spec<=np.log(Lmax)))[0]
-			logLambda_spec = logLambda_spec[specrange]
-			logRebin_spectra = logRebin_spectra[specrange,:]
-			logRebin_noise = logRebin_noise[specrange,:]
-
-			specrange = np.where((logLambda_templates>=np.log(Lmin*0.9)) & 
-									(logLambda_templates<=np.log(Lmax*1.1)))[0]
-			logLambda_templates = logLambda_templates[specrange]
-			templates = templates[specrange,:]
-
-		good_pixels = create_spectrum_mask(logLambda_spec,parameters)
-
-		start, moments, constr_kinem = get_constraints(parameters,spax_properties,vorbin_nums)
-
-		dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-
-		parameteres['components'] = components
-		parameteres['gas_components'] = gas_components
-		parameteres['dv'] = dv
-		parameteres['good_pixels'] = good_pixels
-
-	else:
-		parameters = None
-		templates = None
-
-	parameters = comm.bcast(parameters,root=0)
-	templates = comm.bcast(templates,root=0)
-	
-	comm.barrier()
-	if rank == 0:
-		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-	sys.stdout.flush()
-	for nn in range(1,nproc):
-		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			proc_vorbin_nums = vorbin_nums[proc_spax]
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-			proc_start = [start[pp] for pp in proc_spax]
-			proc_moments = [moments[pp] for pp in proc_spax]
-			proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
-			tosend = [proc_vorbin_nums, #proc_spax_properies,
-						proc_logRebin_spectra,
-						proc_logRebin_noise,
-						proc_start,
-						proc_moments,
-						proc_constr_kinem]
-			comm.send(tosend, dest=nn, tag=100+nn)
-			tosend = None
-
-		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			proc_vorbin_nums = torecieve[0]
-			proc_logRebin_spectra = torecieve[1]
-			proc_logRebin_noise = torecieve[2]
-			proc_start = torecieve[3]
-			proc_moments = torecieve[4]
-			proc_constr_kinem = torecieve[5]
-			torecieve = None
-
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		proc_vorbin_nums = vorbin_nums[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-		proc_start = [start[pp] for pp in proc_spax]
-		proc_moments = [moments[pp] for pp in proc_spax]
-		proc_constr_kinem = [constr_kinem[pp] for pp in proc_spax]
-
-		parameters['spectra_shape'] = logRebin_spectra.shape
-
-		logRebin_spectra = None
-		logRebin_noise = None
-
-	if rank == 0:
-		print(f"Spectra distributed, running fits")
-	sys.stdout.flush()
-
-	comm.barrier()
-
-	outputs = []
-	outputs_all = []
-	for vb, vorbin_num in enumerate(proc_vorbin_nums):
-
-		spectrum = np.array(proc_logRebin_spectra[:,vb])
-		noise = np.array(proc_logRebin_noise[:,vb])	
-
-		proc_parameters = copy.deepcopy(parameters)
-		proc_parameters['spectrum'] = spectrum
-		proc_parameters['noise'] = noise
-		proc_parameters['proc_start'] = proc_start[vb]
-		proc_parameters['proc_moments'] = proc_moments[vb]
-		proc_parameters['proc_constr_kinem'] = proc_constr_kinem[vb]
-
-		fit_out = pPXF_caller(templates, proc_parameters)
-
-		outputs.append(fit_out)
-
-		if vb%100 == 0 and vb !=0:
-			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*vb/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
-				print(f"Gathering outputs so far")
-				# print(f"-------------------------")
-			sys.stdout.flush()
-
-			outputs = comm.gather(outputs,root=0)
-			if rank == 0:
-				outputs_all.extend(outputs)
-				print(f"Outputs gathered, continuing")
-
-				print(f"-------------------------")
-
-			outputs = []
-			sys.stdout.flush()
-	
-	comm.barrier()
-	if rank == 0:
-		print("pPXF fits finished, gathering last outputs to head node")
-		print(f"-------------------------")	
-		sys.stdout.flush()
-
-	outputs = comm.gather(outputs,root=0)
+	outputs = comm.gather(outputs,root=0)								#Gather final outputs
 	if rank == 0:
 		outputs_all.extend(outputs)
 		outputs_all = [oo for output in outputs_all for oo in output]
@@ -893,1017 +397,66 @@ def fit_continuum(parameterfile):
 	proc_logRebin_spectra = None
 	proc_logRebin_noise = None
 
+	if rank == 0:														#Save outputs
+		distribute_save_outputs(parameters, spax_properties,logLambda_spec, outputs_all)
+		runTime = time.time() - startTimeRun
+		print(f'Total wallclock runtime {int(runTime/60)}m{runTime%60:.1f}s')
 
-	if rank == 0:
-		
-		distriute_save_outputs(parameters, spax_properties,logLambda_spec, outputs_all)
 	
-		print("Doing continuum subtraction")
-		sys.stdout.flush()
-		make_continuum_subtracted_spectra(parameterfile)
-		make_line_subcubes(parameterfile)
-		measure_linecubes(parameterfile)
-		make_linecube_fluxmaps(parameterfile)
-		make_linecube_kinmaps(parameterfile)
-
-def fit_continuum_old(parameterfile):
-
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-
-	if rank == 0:
-		print(f"Running with {nproc} processors")
-		print("Preparing inputs")
-		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
-		print(parameters.keys())
-		
-		if 'gas_groups' in parameters.keys() and not isinstance(parameters['gas_groups'],type(None)):
-			gas_flag = True
-		else:
-			gas_flag = False
-
-		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-
-
-		spax_properties = Table.read(spax_properties_file)
-
-		hdul = fits.open(spectra_file)
-		logLambda_spec, spectra  = read_spectra_hdul(hdul)
-		logRebin_spectra = spectra[0]
-		logRebin_noise = spectra[1]
-		spectra = None
-
-		header = hdul[0].header
-		hdul.close()
-		velscale = header['VELSCALE']
-		parameters['galaxy_velscale'] = float(velscale)
-
-		logLambda_templates, stellar_templates = read_EMILES_spectra(parameters)
-		components_stars = [0]*len(stellar_templates[0,:])
-
-		if gas_flag:
-			gas_templates, gas_names, Ncomp_gas = make_gas_templates(parameters,logLambda_templates)
-			components_gas = [[nn + 1 + components_stars[-1]]*NN for nn,NN in enumerate(Ncomp_gas)]
-			components_gas = [comp for group in components_gas for comp in group]
-			good_pixels = create_spectrum_mask(logLambda_spec,parameters,gas_fit=True)
-
-			components = components_stars + components_gas
-			templates = np.column_stack((stellar_templates,gas_templates))
-		else:
-			Ncomp_gas = []
-			gas_names = []
-			good_pixels = create_spectrum_mask(logLambda_spec,parameters)
-			components = components_stars
-			templates = stellar_templates
-
-		constr_kinem = get_constraints(parameters)
-		# print(constr_kinem)
-		# exit()
-
-
-
-		gas_components = np.array(components) > 0
-	
-		moments  = [parameters['continuum_moments']] + \
-					[parameters['continuum_gas_moments']] * len(Ncomp_gas)
-
-		start = [[0,50.]] + [[0,50.]]*len(Ncomp_gas)
-		if len(start)==1:
-			start = start[0]
-			# moments = moments[0]
-
-		# print(len(moments))
-		# print(len(start))
-
-		# print(start)
-		# print(moments)
-
-		dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-		# start =[V,100]
-		Nspec = len(logRebin_spectra[0,:])
-
-	else:
-		parameters = None
-		start = None
-		dv = None
-		templates = None
-		good_pixels = None
-		Nspec = None
-		components = None
-		moments = None
-		constr_kinem = None
-		
-		gas_components = None
-
-	parameters = comm.bcast(parameters,root=0)
-	start = comm.bcast(start,root=0)
-	dv = comm.bcast(dv,root=0)
-	templates = comm.bcast(templates,root=0)
-	good_pixels = comm.bcast(good_pixels,root=0)
-	Nspec = comm.bcast(Nspec,root=0)
-	components = comm.bcast(components,root=0)
-	moments = comm.bcast(moments,root=0)
-	constr_kinem = comm.bcast(constr_kinem,root=0)
-	
-	gas_components = comm.bcast(gas_components,root=0)
-	
-
-	comm.barrier()
-	if rank == 0:
-		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-	sys.stdout.flush()
-	for nn in range(1,nproc):
-		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			proc_spax_properies = spax_properties[proc_spax]
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-			tosend = [proc_spax_properies,
-						proc_logRebin_spectra,
-						proc_logRebin_noise]
-			comm.send(tosend, dest=nn, tag=100+nn)
-			tosend = None
-
-		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			proc_spax_properties = torecieve[0]
-			proc_logRebin_spectra = torecieve[1]
-			proc_logRebin_noise = torecieve[2]
-			torecieve = None
-
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		proc_spax_properties = spax_properties[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-		parameters['spectra_shape'] = logRebin_spectra.shape
-
-
-		logRebin_spectra = None
-		logRebin_noise = None
-		hdul = None
-
-	if rank == 0:
-		print(f"Spectra distributed, running fits")
-	sys.stdout.flush()
-
-	comm.barrier()
-
-	outputs = []
-	outputs_all = []
-
-	for ss in range(len(proc_logRebin_spectra[0,:])):
-
-		spectrum = np.array(proc_logRebin_spectra[:,ss])
-		noise = np.array(proc_logRebin_noise[:,ss])
-		good_pixels_spec = copy.deepcopt(good_pixels)
-		good_pixels_spec[np.isfinite(spectrum)==False] = False
-		good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
-
-		spec_median = np.abs(np.nanmedian(spectrum))
-		var_median = np.abs(np.nanmedian(noise))
-		spectrum = spectrum / spec_median			#nomalise spectrum
-		noise = noise / var_median			#nomalise noise
-		noise[~good_pixels_spec] = 1.e-5			#pPXF doesnt apply goodpix to noise -_-
-
-
-		if np.any(gas_components):
-			out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start,
-				moments = moments,
-				component=components,
-				degree = -1,										# additive can affect Balmer fluxes
-				mdegree = parameters['continuum_mdegree'],
-				gas_component = gas_components,
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				clean=True,
-				constr_kinem = constr_kinem,
-				plot=False,
-				quiet=True)
-		else:
-			out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start,
-				moments = moments,
-				component=components,
-				degree = -1,										# additive can affect Balmer fluxes
-				mdegree = parameters['continuum_mdegree'],
-				# gas_component = gas_components,
-				# velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				clean=True,
-				constr_kinem = constr_kinem,
-				plot=False,
-				quiet=True)
-
-
-
-		
-		bestfit_spectrum = out.bestfit*spec_median
-		if gas_flag:
-			bestfit_gas = out.gas_bestfit*spec_median
-		else:
-			bestfit_gas = np.zeros_like(bestfit_spectrum)
-		bestfit_stars = bestfit_spectrum - bestfit_gas
-
-
-		outputs.append([int(proc_spax_properties['vorbin_num'][ss]),bestfit_stars,bestfit_gas])
-			
-	
-		if ss%100 == 0 and ss !=0:
-			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*ss/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
-				print(f"Gathering outputs so far")
-				print(f"-------------------------")
-			sys.stdout.flush()
-
-			outputs = comm.gather(outputs,root=0)
-			if rank == 0:
-				outputs_all.extend(outputs)
-			outputs = []
-				
-
-			# if rank == 0:
-			# 	mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-			# 	print(mem)
-			# 	h = hpy().heap()
-			# 	print(h.byrcs)
-
-
-	comm.barrier()
-	if rank == 0:
-		print("pPXF fits finished, gathering last outputs to head node")
-	outputs = comm.gather(outputs,root=0)
-	if rank == 0:
-		outputs_all.extend(outputs)
-		outputs_all = [oo for output in outputs_all for oo in output]
-	comm.barrier()
-		
-	if rank == 0:
-		bestfit_continuum = np.zeros(parameters['spectra_shape'])
-		bestfit_gas = np.zeros(parameters['spectra_shape'])
-		for out in outputs_all:
-			vorbin_num = out[0]
-			stars = out[1]
-			gas = out[2]
-			ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0][0]
-			# ref = np.in1d(spax_properties['vorbin_num'][:], vorbin_num)
-			bestfit_continuum[:,ref] = stars
-			bestfit_gas[:,ref] = gas
-
-		header["COMMENT1"] = "Best fit continuum spectra for individual spaxels"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		bestfit_stars_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_continuum.T,
-								name='BESTSTARS',format=str(len(bestfit_continuum))+'D'
-								)]))
-		bestfit_gas_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_gas.T,
-								name='BESTGAS',format=str(len(bestfit_gas))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,
-							bestfit_stars_hdu,
-							bestfit_gas_hdu])
-		print("Saving continuum spectra table")
-		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-def fit_individual_continuum(parameterfile):
-	# import mpi4py
-	# print(mpi4py.get_config())
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-	if rank == 0:
-		print(f"Running with {nproc} processors")
-		print("Preparing inputs")
-		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
-		
-		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-		spax_properties = Table.read(spax_properties_file)
-
-		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-		hdul = fits.open(spectra_file)
-		logLambda_spec, spectra  = read_spectra_hdul(hdul)
-		logRebin_spectra = spectra[0]
-		logRebin_noise = spectra[1]
-		spectra = None
-
-		header = hdul[0].header
-		hdul.close()
-		velscale = header['VELSCALE']
-		parameters['galaxy_velscale'] = float(velscale)
-		# print(velscale)
-
-		gas_flag = False
-		if not isinstance(parameters['gas_groups'],type(None)):
-			gas_flag = True
-
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-
-		logLambda_templates, stellar_templates = read_EMILES_spectra(parameters)
-		components_stars = [0]*len(stellar_templates[0,:])
-
-		if gas_flag:
-			gas_templates, gas_names, Ncomp_gas = make_gas_templates(parameters,logLambda_templates)
-			parameters['Ncomp_gas'] = Ncomp_gas
-			components_gas = [[nn + 1 + components_stars[-1]]*NN for nn,NN in enumerate(Ncomp_gas)]
-			components_gas = [comp for group in components_gas for comp in group]
-			good_pixels = create_spectrum_mask(logLambda_spec,parameters,gas_fit=True)
-
-			components = components_stars + components_gas
-			templates = np.column_stack((stellar_templates,gas_templates))
-		else:
-			Ncomp_gas = []
-			gas_names = []
-			good_pixels = create_spectrum_mask(logLambda_spec,parameters)
-			components = components_stars
-			templates = stellar_templates
-
-
-		gas_components = np.array(components) > 0
-	
-		
-
-		start, moments, constraints = get_constraints(parameters,spax_properties,vorbin_nums)
-		# print(len(constraints))
-		# print(constraints)
-		# exit()
-
-
-		parameters['dv'] = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-
-
-	else:
-		parameters = None
-		templates = None
-		good_pixels = None
-		components = None
-		moments = None
-		start = None
-		gas_flag = None
-		constraints = None
-		gas_components = None
-
-		# Ncomp_gas = None
-
-	parameters = comm.bcast(parameters,root=0)
-	templates = comm.bcast(templates,root=0)
-	good_pixels = comm.bcast(good_pixels,root=0)
-	components = comm.bcast(components,root=0)
-	moments = comm.bcast(moments,root=0)
-	start = comm.bcast(start,root=0)
-	gas_flag = comm.bcast(gas_flag,root=0)
-	constraints = comm.bcast(constraints,root=0)
-	gas_components = comm.bcast(gas_components,root=0)
-	
-	# Ncomp_gas = comm.bcast(Ncomp_gas,root=0)
-	
-
-	comm.barrier()
-	if rank == 0:
-		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-	sys.stdout.flush()
-	for nn in range(1,nproc):
-		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			# proc_spax_properies = spax_properties[proc_spax]
-			proc_vorbin_nums = vorbin_nums[proc_spax]
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-			tosend = [proc_vorbin_nums, #proc_spax_properies,
-						proc_logRebin_spectra,
-						proc_logRebin_noise]
-			comm.send(tosend, dest=nn, tag=100+nn)
-			tosend = None
-
-		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			# proc_spax_properties = torecieve[0]
-			proc_vorbin_nums = torecieve[0]
-			proc_logRebin_spectra = torecieve[1]
-			proc_logRebin_noise = torecieve[2]
-			torecieve = None
-
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		# proc_spax_properties = spax_properties[proc_spax]
-		proc_vorbin_nums = vorbin_nums[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-		parameters['spectra_shape'] = logRebin_spectra.shape
-
-
-		logRebin_spectra = None
-		logRebin_noise = None
-		hdul = None
-
-	if rank == 0:
-		print(f"Spectra distributed, running fits")
-	sys.stdout.flush()
-
-	comm.barrier()
-
-
-	outputs = []
-	outputs_all = []
-
-	# proc_vorbin_nums = proc_vorbin_nums[2292::]
-
-	# for ss in range(len(proc_logRebin_spectra[0,:])):
-	for vb, vorbin_num in enumerate(proc_vorbin_nums):
-		# print(vorbin_num)
-
-		spectrum = np.array(proc_logRebin_spectra[:,vb])
-		noise = np.array(proc_logRebin_noise[:,vb])
-		noise = np.sqrt(noise)
-		good_pixels_spec = copy.deepcopy(good_pixels)
-		good_pixels_spec[np.isfinite(spectrum)==False] = False
-		good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
-
-
-		spec_median = np.abs(np.nanmedian(spectrum))
-		spectrum = spectrum / spec_median			#nomalise spectrum
-		# var_median = np.abs(np.nanmedian(noise))
-		# noise = noise / var_median			#nomalise noise
-		noise[~good_pixels_spec] = 1.e10	
-
-		constr = constraints[vorbin_num]
-		if isinstance(constr,list):
-			constr = constr[0]
-		# print(constr)
-		# print(start[vorbin_num])
-		# print(moments[vorbin_num])
-		# exit()
-
-		# start = [list(stel_kin[['V_stellar','sigma_stellar','h3_stellar','h4_stellar']][int(vorbin_num)])] + [[0,30.]] + [[0,50]]*(len(parameters['Ncomp_gas'])-1)
-
-		# try:
-		if gas_flag:
-
-			out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start[vorbin_num],
-				moments = moments[vorbin_num],
-				component = components,
-				# degree = parameters['stars_degree'],
-				degree = -1,					# parameters['gas_degree'] #additive can affect Balmer fluxes
-				mdegree= parameters['cont_mdegree'],
-				gas_component = gas_components,
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = parameters['dv'],
-				constr_kinem = constr,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				plot=False,
-				quiet=True
-				)
-
-
-		else:
-
-			out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start[vorbin_num],
-				moments = moments[vorbin_num],
-				component = components,
-				# degree = parameters['stars_degree'],
-				degree = -1,					# parameters['gas_degree'] #additive can affect Balmer fluxes
-				mdegree= parameters['cont_mdegree'],
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				constr_kinem = constr,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				plot=False,
-				quiet=True
-				)
-		# except:
-			# print(vorbin_num)
-			# print(constr)
-			# print(np.array(start[vorbin_num][0])/velscale)
-			# exit()
-
-		# plt.show()
-
-		bestfit_spectrum = out.bestfit*spec_median
-		if gas_flag:
-			bestfit_gas = out.gas_bestfit*spec_median
-		else:
-			bestfit_gas = np.zeros_like(bestfit_spectrum)
-		bestfit_stars = bestfit_spectrum - bestfit_gas
-
-		# outputs.append([vorbin_num,out.gas_flux,out.gas_flux_error,out.sol])
-
-		outputs.append([vorbin_num,bestfit_stars,bestfit_gas])
-		# plt.show()		
-	
-		if vb%100 == 0 and vb !=0:
-			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*vb/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
-				print(f"Gathering outputs so far")
-				print(f"-------------------------")
-			sys.stdout.flush()
-
-			outputs = comm.gather(outputs,root=0)
-			if rank == 0:
-				outputs_all.extend(outputs)
-			outputs = []
-	
-	comm.barrier()
-	if rank == 0:
-		print("pPXF fits finished, gathering last outputs to head node")
-	outputs = comm.gather(outputs,root=0)
-	if rank == 0:
-		outputs_all.extend(outputs)
-		outputs_all = [oo for output in outputs_all for oo in output]
-	comm.barrier()
-
-
-	if rank == 0:
-		bestfit_continuum = np.zeros(parameters['spectra_shape'])
-		bestfit_gas = np.zeros(parameters['spectra_shape'])
-		for out in outputs_all:
-			vorbin_num = out[0]
-			stars = out[1]
-			gas = out[2]
-			ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0][0]
-			bestfit_continuum[:,ref] = stars
-			bestfit_gas[:,ref] = gas
-
-		header["COMMENT1"] = "Best fit continuum spectra for individual spaxels"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		bestfit_continuum_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_continuum.T,
-								name='BESTSTARS',format=str(len(bestfit_continuum))+'D'
-								)]))
-		bestfit_gas_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_gas.T,
-								name='BESTGAS',format=str(len(bestfit_gas))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,
-							bestfit_continuum_hdu,
-							bestfit_gas_hdu])
-			
-		if not os.path.isdir(f"{parameters['output_dir']}"):
-			os.mkdir(f"{parameters['output_dir']}")
-			os.mkdir(f"{parameters['output_dir']}/figures")
-
-		print("Saving continuum spectra table")
-		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-def fit_gas_lines(parameterfile):
-
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-	if rank == 0:
-		print(f"Running with {nproc} processors")
-		print("Preparing inputs")
-		sys.stdout.flush()
-		parameters = read_parameterfile(parameterfile)
-		
-		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-
-
-		spax_properties = Table.read(spax_properties_file)
-
-		hdul = fits.open(spectra_file)
-		logLambda_spec, spectra  = read_spectra_hdul(hdul)
-		logRebin_spectra = spectra[0]
-		logRebin_noise = spectra[1]
-		spectra = None
-
-		header = hdul[0].header
-		hdul.close()
-		velscale = header['VELSCALE']
-		parameters['galaxy_velscale'] = float(velscale)
-
-		logLambda_templates, stellar_templates = read_EMILES_spectra(parameters)
-
-		gas_templates, gas_names, Ncomp_gas = make_gas_templates(parameters,logLambda_templates)
-
-		components_stars = [0]*len(stellar_templates[0,:])
-		components_gas = [[nn+components_stars[-1]+1]*NN for nn,NN in enumerate(Ncomp_gas)]
-		components_gas = [comp for group in components_gas for comp in group]
-
-		# print(components_gas)
-		# exit()
-
-		good_pixels = create_spectrum_mask(logLambda_spec,parameters,gas_fit=True)
-
-		stellar_kin_file = f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits"
-		stel_kin = Table.read(stellar_kin_file)
-		# stel_kin = stel_kin['V_stellar','sigma_stellar',
-											# 'h3_stellar','h4_stellar'][:]
-		V = 0
-		dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-		start =[V,50]
-		Nspec = len(logRebin_spectra[0,:])
-		# print(dv)
-		# exit()
-
-	else:
-		parameters = None
-		start = None
-		dv = None
-		stellar_templates = None
-		good_pixels = None
-		Nspec = None
-		components_stars = None
-		stel_kin = None
-		
-		gas_templates = None
-		components_gas = None
-		Ncomp_gas = None
-
-	parameters = comm.bcast(parameters,root=0)
-	start = comm.bcast(start,root=0)
-	dv = comm.bcast(dv,root=0)
-	stellar_templates = comm.bcast(stellar_templates,root=0)
-	good_pixels = comm.bcast(good_pixels,root=0)
-	Nspec = comm.bcast(Nspec,root=0)
-	components_stars = comm.bcast(components_stars,root=0)
-	stel_kin = comm.bcast(stel_kin,root=0)
-	
-	gas_templates = comm.bcast(gas_templates,root=0)
-	components_gas = comm.bcast(components_gas,root=0)
-	Ncomp_gas = comm.bcast(Ncomp_gas,root=0)
-	
-
-	comm.barrier()
-	if rank == 0:
-		print(f"Head node distributing {len(logRebin_spectra[0,:])} spectra")
-	sys.stdout.flush()
-	for nn in range(1,nproc):
-		if rank == 0:
-			proc_spax = np.arange(nn,len(logRebin_spectra[0,:]),nproc,dtype=int)
-			proc_spax_properies = spax_properties[proc_spax]
-			proc_spax_stelkin = stel_kin[proc_spax]
-			# print((proc_spax_stelkin))
-			proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-			proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-			tosend = [proc_spax_properies,
-						proc_spax_stelkin,
-						proc_logRebin_spectra,
-						proc_logRebin_noise]
-			comm.send(tosend, dest=nn, tag=100+nn)
-			tosend = None
-
-		elif rank == nn:
-			torecieve = comm.recv(source=0, tag=100+rank)
-			proc_spax_properties = torecieve[0]
-			proc_spax_stelkin = torecieve[1]
-			proc_logRebin_spectra = torecieve[2]
-			proc_logRebin_noise = torecieve[3]
-			torecieve = None
-
-	if rank == 0:
-		proc_spax = np.arange(0,len(logRebin_spectra[0,:]),nproc,dtype=int)
-		proc_spax_properties = spax_properties[proc_spax]
-		proc_spax_stelkin = stel_kin[proc_spax]
-		proc_logRebin_spectra = logRebin_spectra[:,proc_spax]
-		proc_logRebin_noise = logRebin_noise[:,proc_spax]
-
-		parameters['spectra_shape'] = logRebin_spectra.shape
-
-
-		# logRebin_spectra = None
-		logRebin_noise = None
-		hdul = None
-
-	if rank == 0:
-		print(f"Spectra distributed, running fits")
-	sys.stdout.flush()
-
-	comm.barrier()
-
-	outputs = []
-	outputs_all = []
-
-
-	for ss in range(len(proc_logRebin_spectra[0,:])):
-
-		#spaxel has stellar kinematics fit
-		if proc_spax_properties['vorbin_num'][ss] >=0:
-		# if True:
-			templates = np.column_stack((stellar_templates,gas_templates))
-
-			components = components_stars + components_gas
-							
-			gas_components = np.array(components) > 0
-
-			moments  = [-parameters['stars_moments']] + \
-						[parameters['gas_moments']] * len(Ncomp_gas)
-
-			start = [list(proc_spax_stelkin[ss])] + [[0,50.]]*len(Ncomp_gas)
-
-
-		elif proc_spax_properties['vorbin_num'][ss] < 0: #spaxel does not have stellar kinematics
-			
-			templates = gas_templates
-
-			components = components_gas
-							
-			gas_components = np.array(components) > 0
-
-			moments  = [parameters['gas_moments']] * len(Ncomp_gas)
-
-			if len(Ncomp_gas)>1:
-				start = [[0.,50.]]*len(Ncomp_gas)
-			else:
-				start = [[0.,50.]]
-
-
-		# print(components)
-
-		spectrum = np.array(proc_logRebin_spectra[:,ss])
-		noise = np.array(proc_logRebin_noise[:,ss])
-		good_pixels_spec = copy.deepcopy(good_pixels)
-		good_pixels_spec[np.isfinite(spectrum)==False] = False
-		good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
-
-		spec_median = np.abs(np.nanmedian(spectrum))
-		var_median = np.abs(np.nanmedian(noise))
-		spectrum = spectrum / spec_median			#nomalise spectrum
-		noise = noise / var_median			#nomalise noise
-		noise[~good_pixels_spec] = 1.e-5			#pPXF doesnt apply goodpix to noise -_-
-
-
-		out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start,
-				moments = moments,
-				component = components,
-				# degree = parameters['stars_degree'],
-				degree = -1,					# parameters['gas_degree'] #additive can affect Balmer fluxes
-				mdegree= parameters['gas_mdegree'],
-				gas_component = gas_components,
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels],
-				plot=False,
-				quiet=True
-				)
-		# plt.show()
-
-		outputs.append([int(proc_spax_properties['vorbin_num'][ss]),out.gas_flux,out.gas_flux_error,out.sol])
-		# plt.show()		
-	
-		if ss%100 == 0 and ss !=0:
-			comm.barrier()
-			if rank == 0:
-				print(f"Proc {rank} is {100*ss/len(proc_logRebin_spectra[0,:]):.2f}% through {len(proc_logRebin_spectra[0,:])} spectra")
-				print(f"Gathering outputs so far")
-				print(f"-------------------------")
-			sys.stdout.flush()
-
-			outputs = comm.gather(outputs,root=0)
-			if rank == 0:
-				outputs_all.extend(outputs)
-			outputs = []
-	
-	comm.barrier()
-	if rank == 0:
-		print("pPXF fits finished, gathering last outputs to head node")
-	outputs = comm.gather(outputs,root=0)
-	if rank == 0:
-		outputs_all.extend(outputs)
-		outputs_all = [oo for output in outputs_all for oo in output]
-	comm.barrier()
-
-
-	if rank == 0:
-		
-
-		spax_properties = Table.read(spax_properties_file)
-		gas_kin = np.full([len(spax_properties),2*len(Ncomp_gas)+2*len(gas_names)],np.nan)
-		names = [f'{k}_gas_C{ii+1}' for ii in range(len(Ncomp_gas)) for k in ['V','sigma']] + \
-				 [f'{ll}_flux{ee}' for ll in gas_names for ee in ['','err']]
-
-		for out in outputs_all:
-			vorbin_num = out[0]
-			flux =out[1]
-			flux_err = out[2]
-			kin = out[3]
-			if isinstance(kin[0],float):
-				kin = np.array(kin).flatten()
-			else:
-				kin = np.array(kin[len(kin) - len(Ncomp_gas):]).flatten()
-
-			ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0]
-			# print(names)
-			# print(kin,flux,flux_err)
-			# print(np.hstack((kin,flux,flux_err)))
-
-			gas_kin[ref,:] = np.hstack((kin,flux,flux_err))
-
-			# for v,k in enumerate(['V','sigma','h3','h4']):
-					# spax_properties[f'{k}_stellar'][ref] = fit.sol[v]
-
-				
-		gas_kin = Table(gas_kin,names=names)
-		print("Saving bestfit gas kinematics table")
-		gas_kin.write(f"{parameters['output_dir']}/bestfit_gas_kinematics.fits",overwrite=True)
-		# spax_properties.write(spax_properties_file,overwrite=True)
-
-def fit_individual_spectrum(parameterfile):
-	parameters = read_parameterfile(parameterfile)
-		
-	spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-	spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-
-
-	spax_properties = Table.read(spax_properties_file)
-	
-	hdul = fits.open(spectra_file)
-	logLambda_spec, spectra  = read_spectra_hdul(hdul)
-	logRebin_spectra = spectra[0]
-	logRebin_noise = spectra[1]
-	spectra = None
-
-	ref = np.where((spax_properties['spax_xx'] == parameters['indiv_xx']) &
-						(spax_properties['spax_yy'] == parameters['indiv_yy']))[0]
-
-	vorbin_num = spax_properties['vorbin_num'][ref]
-
-
-	spectrum = np.asarray(logRebin_spectra[:,vorbin_num]).flatten()
-	noise = np.asarray(logRebin_noise[:,vorbin_num]).flatten()
-
-	#truncate to fit range
-	if 'indiv_lrange' in parameters.keys():
-		Lmin = parameters['indiv_lrange'][0]
-		Lmax = parameters['indiv_lrange'][1]
-		specrange = np.where((logLambda_spec>=np.log(Lmin)) & 
-								(logLambda_spec<=np.log(Lmax)))[0]
-		logLambda_spec = logLambda_spec[specrange]
-		spectrum = spectrum[specrange]
-		noise = noise[specrange]
-
-	header = hdul[0].header
-	hdul.close()
-	velscale = header['VELSCALE']
-	parameters['galaxy_velscale'] = float(velscale)
-
-
-	logLambda_templates, stellar_templates = read_EMILES_spectra(parameters)
-	components_stars = [0]*len(stellar_templates[0,:])
-
-
-	if not isinstance(parameters['gas_groups'],type(None)):
-		gas_templates, gas_names, Ncomp_gas = make_gas_templates(parameters,logLambda_templates)
-		components_gas = [[nn + 1 + components_stars[-1]]*NN for nn,NN in enumerate(Ncomp_gas)]
-		components_gas = [comp for group in components_gas for comp in group]
-
-		components = components_stars + components_gas
-		templates = np.column_stack((stellar_templates,gas_templates))
-
-
-		good_pixels = create_spectrum_mask(logLambda_spec,parameters,gas_fit=True)
-	else:
-		Ncomp_gas = []
-		components = components_stars
-		templates = stellar_templates
-
-		moments  = [parameters['indiv_moments']]
-				
-	constr_kinem = get_constraints(parameters)
-
-	# print(constr_kinem)
-
-	moments  = [parameters['indiv_moments']] + \
-				[parameters['indiv_gas_moments']] * len(Ncomp_gas)
-	gas_components = np.array(components) > 0
-	
-	# print(moments)
-
-	dv = c*(np.nanmean(logLambda_templates[:parameters['velscale_ratio']]) - logLambda_spec[0]) # km/s
-	start = parameters['indiv_start']
-	start = [start] + [[0,50.]] + [[0,200]]*(len(Ncomp_gas)-1)
-
-
-	good_pixels_spec = copy.deepcopy(good_pixels)
-	good_pixels_spec[np.isfinite(spectrum)==False] = False
-	good_pixels_spec[(np.isfinite(noise)==False) | (noise <= 0)] = False
-
-	spec_median = np.abs(np.nanmedian(spectrum))
-	spectrum = spectrum / spec_median			#nomalise spectrum
-	# var_median = np.abs(np.nanmedian(noise))
-	# noise = noise / var_median			#nomalise noise
-	noise[~good_pixels_spec] = 1.e10		
-	
-
-	# templates = np.hstack((np.zeros(len(spectrum)+10),np.ones(len(spectrum)+10))).T
-	if not isinstance(parameters['gas_groups'],type(None)):
-		out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start,
-				lam = np.exp(logLambda_spec),
-				moments = moments,
-				component = components,
-				degree = -1,
-				mdegree = parameters['indiv_mdegree'],
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				gas_component = gas_components,
-				constr_kinem = constr_kinem,
-				plot=True,
-				clean=False,
-				quiet=False)
-	else:
-
-		out = ppxf(templates, spectrum, noise,
-				velscale = parameters['galaxy_velscale'],
-				start = start,
-				lam = np.exp(logLambda_spec),
-				moments = parameters['indiv_moments'],
-				degree = parameters['indiv_degree'],
-				mdegree = parameters['indiv_mdegree'],
-				velscale_ratio = parameters['velscale_ratio'],
-				vsyst = dv,
-				goodpixels=np.arange(len(spectrum))[good_pixels_spec],
-				constr_kinem = constr_kinem,
-				plot=True,
-				clean=False,
-				quiet=False)
-	# print(out.error*np.sqrt(out.chi2))
-	plt.show()
-###
-
-
-###data reading and binning
+### Data reading and binning ###
 def read_parameterfile(filename = None):
+	"""
+	Read a parameter file and creates the parameter dictionary, with defaults
+	Parameters
+	----------
+	filename : string
+		Path to parameter file
 
-	if filename is None:
+	Returns
+	-------
+	parameters : dict
+		Dictionary of parameters to be passed to the fitting function
+	"""
+
+	if filename is None: 				#Default  file
 		filename = "./parameters.param"
 
-
-	#default values
+	#Set code running path and parameter defaults	
+	run_path = os.path.abspath(filename).split("/parameterfiles/")[0]
 	parameters = {'read_data':False,'run_vorbin':False,'run_stelkin':False,'run_continuum':False,
-					'base': home_dir,
-					'output': f"{os.path.abspath('./').split(home_dir)[1]}/outputs",
-					'velscale_ratio': 1, 'degree':4, 'mdegree':0,
-					'vorbin_type':'normal',
+					'base': run_path,
+					'output': f"outputs",
+					'velscale_ratio': 1, 'degree':-1, 'mdegree':-1,
+					'spatial_mask': None,'vorbin_type':'normal',
+					'run_fit': False, 'stelkin_outputs':False, 'continuum_outputs':False, 'binned_contsub':False,
+					'plot': False,
 					'gas_groups': None, 'gas_names': [],'gas_Ncomp': [],'gas_constraints': None,
 					'fit_CaT':False}
 
-
 	f = open(filename)
-	for line in f:
-		# print(line)
-		if line[0] == "#" or line[0] == " ":
-				
+	for line in f:									#Loop over lines in file and read parameters
+		if line[0] == "#" or line[0] == " ":		#Skip comment or empty lines
 			continue
 		else:
 			line = line.split("\n")[0].split(" ")
 
-			if line[0] == "read_data":
+			if line[0] == "read_data":				#Valid parameters
 				parameters[line[0]] = eval(line[1])
 			if line[0] == "run_vorbin":
 				parameters[line[0]] = eval(line[1])
 			if line[0] == "run_stelkin":
 				parameters[line[0]] = eval(line[1])
 			if line[0] == "run_continuum":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "stelkin_outputs":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "continuum_outputs":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "run_fit":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "binned_contsub":
+				parameters[line[0]] = eval(line[1])
+			if line[0] == "plot":
 				parameters[line[0]] = eval(line[1])
 
 			if line[0] == "datacube":
@@ -1932,7 +485,7 @@ def read_parameterfile(filename = None):
 			elif "lrange" in line[0]:
 				parameters[line[0]] = [float(line[1]),float(line[2])]
 
-			elif "gas_param" in line[0]:
+			elif "gas_param" in line[0]:					#Read gas emission line parameter file
 				gas_properties = read_gaslines_parameterfile(line[1])
 				parameters['gas_groups'] = gas_properties[0]
 				parameters['gas_names'] = gas_properties[1]
@@ -1947,41 +500,45 @@ def read_parameterfile(filename = None):
 					except:
 						parameters[line[0]] = line[1]
 
-
+	#Update with specific running paths
 	parameters['output'] = f"{parameters['base']}/{parameters['output']}"
 	parameters['output_dir'] = f"{parameters['output']}/{parameters['output_dir']}"
+
+	#Allow separate input and output directories. 
 	if "input_dir" in parameters.keys():
 		parameters['input_dir'] = f"{parameters['output']}/{parameters['input_dir']}"
 
 	else:
 		parameters['input_dir'] = parameters['output_dir']
 
-	#maybe to be added
-	# if isinstance(parameters['gas_components'],type(None)):
-	# 	if parameters['degree'] != -1:
-	# 		print("Additive polynomials not recommended if fitting gas lines!")
-	# 		print("Assigning to multiplicative polynomials.")
-	# 		if parameters['degree'] != 0:
-	# 			parameteres['mdegree'] = parameters['degree']
-	# 		parameteres['degree'] = -1
 
 	return parameters
 
 def read_gaslines_parameterfile(filename = None):
-	if filename is None:
+	"""
+	Read a gas line parameter file and creates the gas lines parameters, with defaults
+	Parameters
+	----------
+	filename : string
+		Path to parameter file
+
+	Returns
+	-------
+	gas_params : list
+		List of gas lines and constraints
+	"""
+
+	if filename is None:						#default parameter file				
 		filename = "./gaslines.param"
-
-	parameters = {}
-
-	f = open(filename)
-
 
 	gas_groups = []
 	gas_group = []
 	constr_kinem = {'A_ineq':[],'b_ineq':[]}
-	for line in f:
-		if line[0] == "#" or line[0] == " " or line[0] == "\n":
-			if gas_group != []:	
+
+	f = open(filename)
+	for line in f:											#loop over lines
+		if line[0] == "#" or line[0] == " " or line[0] == "\n":	
+			if gas_group != []:								#Identifies a new line kinematic group	
 				gas_groups.append(gas_group)
 				gas_group = []
 			continue
@@ -1993,18 +550,13 @@ def read_gaslines_parameterfile(filename = None):
 			constr_kinem['A_ineq'].append(A)
 			constr_kinem['b_ineq'].extend([b])
 
-
-
-
 		else:
-			line = line.split("\n")[0].split(" ")
-			# print(line)
+			line = line.split("\n")[0].split(" ")			#Add line to group
 			gas_group.extend(line)
 	if gas_group != []:	
 		gas_groups.append(gas_group)
 
-
-	gas_Ncomp = []
+	gas_Ncomp = []											#Make ppxf-style inputs
 	gas_names = []
 	for gg, group in enumerate(gas_groups):
 		for gl, gas_line in enumerate(group):
@@ -2012,9 +564,24 @@ def read_gaslines_parameterfile(filename = None):
 		gas_Ncomp.extend([gl+1])
 
 
-	return [gas_groups, gas_names, gas_Ncomp, constr_kinem]
+	gas_params = [gas_groups, gas_names, gas_Ncomp, constr_kinem]
+	return gas_params
 
 def make_spectra_tables(parameterfile):
+	"""
+	Read a datacube and makes a pixel table and 2D spectrum list
+	Parameters
+	----------
+	parameterfile : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing 
+		Outputs are written to file
+	"""
+
+	#Ensure if run in MPI mode that only the head node handles this
 	comm = MPI.COMM_WORLD
 	rank = comm.Get_rank()
 	nproc = comm.Get_size()
@@ -2022,6 +589,7 @@ def make_spectra_tables(parameterfile):
 	if rank == 0:
 		parameters = read_parameterfile(parameterfile)
 
+		#Make directories if not already existing
 		if not os.path.isdir(f"{parameters['output']}/indiv"):
 			os.mkdir(f"{parameters['output']}/indiv")
 		if not os.path.isdir(f"{parameters['output']}/testcube"):
@@ -2030,7 +598,7 @@ def make_spectra_tables(parameterfile):
 			os.mkdir(f"{parameters['output']}/test")
 
 
-
+		#Check if these data files have already been made
 		if os.path.isfile(f"{parameters['output']}/indiv/spaxel_properties.fits") and\
 			os.path.isfile(f"{parameters['output']}/indiv/spectra_indiv.fits") and\
 			os.path.isfile(f"{parameters['output']}/indiv/logRebin_spectra.fits"):
@@ -2061,14 +629,14 @@ def make_spectra_tables(parameterfile):
 
 			print("All read in")
 
-		else:
+		else:				#Read the data cube
 
 			hdul = fits.open(parameters['datacube'])
 			header = hdul[1].header
 
 			spectra = hdul[1].data
 			noise = np.sqrt(hdul[2].data)
-			hdul = None
+			hdul = None				#Free up memory
 
 			Nx = header['NAXIS1']
 			Ny = header['NAXIS2']
@@ -2077,10 +645,11 @@ def make_spectra_tables(parameterfile):
 			spectra = spectra.reshape(Nl, Nx*Ny)
 			noise = noise.reshape(Nl, Nx*Ny)
 
+			#Create and de-redshift spectral axis
 			linLambda_obs = astrofunc.get_wavelength_axis(header)
-			#de-redshift spectra
-			linLambda_obs = linLambda_obs / (1.e0 + parameters['z'])
+			linLambda_obs = linLambda_obs / (1.e0 + parameters['z'])		
 
+			#Truncate to desired wavelength range
 			if 'lrange' in parameters.keys():
 				Lambda_range = np.logical_and(linLambda_obs >= parameters['lrange'][0] ,
 										linLambda_obs <= parameters['lrange'][1])
@@ -2089,41 +658,25 @@ def make_spectra_tables(parameterfile):
 				noise = noise[Lambda_range]
 				linLambda_obs = linLambda_obs[Lambda_range]
 
-
-
+			#Set up pixel and bin IDs
 			spax_number = np.arange(Nx*Ny,dtype='int')
 			vorbin_number = np.zeros([Nx*Ny],dtype='int')
+			
+			#Identify bad pixels
 			obs_flags = np.all(np.isfinite(spectra), axis = 0)
 			obs_flags_nums = np.zeros(Nx*Ny)
 			obs_flags_nums[obs_flags] = 1
-
 			spec_good = np.where(obs_flags_nums == 1)[0]
 			spec_bad = np.where(obs_flags_nums == 0)[0]
 
-
+			#Measure signal to noise over desired range
 			SN_cont_Lrange = np.logical_and(linLambda_obs >= parameters['SN_lrange'][0] , 
 											linLambda_obs <= parameters['SN_lrange'][1])
 			spax_signal_cont = np.nanmedian(spectra[SN_cont_Lrange,:], axis = 0)
 			spax_noise_cont = np.abs(np.nanmedian(noise[SN_cont_Lrange,:], axis = 0))
 
-			# if 'SN_line' in parameters.keys():
-			# 	spax_signal_line = np.zeros([Nx*Ny,len(parameters['SN_line'])])
-			# 	spax_noise_line = np.zeros([Nx*Ny,len(parameters['SN_line'])])
-			# 	spax_line_names = []
-
-			# 	for ii in range(len(parameters['SN_line'])):
-			# 		print(emlines[parameters['SN_line'][ii]]['lambda'])
-			# 		print(emlines[parameters['SN_line'][ii]]['lambda'][-1])
-					
-			# 		lineLambda = emlines[parameters['SN_line'][ii]]['lambda'][-1]
-
-			# 		SN_line_Lrange = np.logical_and(linLambda_obs >= lineLambda*(1-500/c) , 
-			# 								linLambda_obs <= lineLambda*(1+500/c) )
-			# 		spax_signal_line[:,ii] = np.nansum(spectra[SN_line_Lrange,:], axis = 0)
-			# 		spax_noise_line[:,ii] = np.nansum(noise[SN_line_Lrange,:], axis = 0)
-
-
-			spax_xxyy , spax_RADEC, spax_SP = astrofunc.make_pix_WCS_grids(header)
+			#Pixel coordinates
+			spax_xxyy, spax_RADEC, spax_SP = astrofunc.make_pix_WCS_grids(header)
 			spax_size = np.abs(np.diff(spax_SP[0])[0])
 
 			spax_properties = np.column_stack([spax_number.astype(int),
@@ -2136,17 +689,17 @@ def make_spectra_tables(parameterfile):
 											spax_SP[0].reshape(Nx*Ny),
 											spax_SP[1].reshape(Nx*Ny),
 											spax_signal_cont,
-											spax_noise_cont,
-											# spax_signal_line,
-											# spax_noise_line
+											spax_noise_cont
 											]
 											)
 
-			#trim to only good observed spaxels to save memory
+			#Trim to only good observed spaxels to save memory
 			spax_properties = spax_properties[spec_good]
 
-			metadata = {'Nx':Nx,'Ny':Ny,'Nl':Nl,'d_spax':spax_size,'z':parameters['z']}
-
+			#Table metadata
+			metadata = {'Nx':Nx,'Ny':Ny,'Nl':Nl,'d_spax':spax_size,'z':parameters['z'],
+						'SN_LMIN':parameters['SN_lrange'][0],'SN_LMIN':parameters['SN_lrange'][1]}
+			#Set up pixel table
 			spax_properties = Table(spax_properties,
 						names=['spax_num','vorbin_num','obs_flag','spax_xx','spax_yy',
 								'spax_RA','spax_DEC','spax_SPxx','spax_SPyy',
@@ -2155,21 +708,22 @@ def make_spectra_tables(parameterfile):
 								# [f'spax_noise_{line}' for line in parameters['SN_line']],
 								meta=metadata)
 
+			#Assign bin numbers only to good spectra
 			spax_properties['vorbin_num'] = np.arange(len(spax_properties),dtype='int')
 			
+			#Save individual spaxel properties
 			print("Saving individual spaxel properties")
 			sys.stdout.flush()
-			#save individual spaxel properties
 			spax_properties.write(f"{parameters['output']}/indiv/spaxel_properties.fits",overwrite=True)
 			print("Saved")
 			sys.stdout.flush()
 
 
-			#trim spectra to only observed spaxels
+			#Trim spectra to only good observed spaxels
 			spectra = spectra[:,spec_good]
 			noise = noise[:,spec_good]
 
-			#save individual spectra
+			#Save individual spectra
 			indiv_header = fits.Header()
 			indiv_header['COMMENT'] = "A.B. Watts"
 			indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
@@ -2181,14 +735,12 @@ def make_spectra_tables(parameterfile):
 									array = spectra.T,
 									name='SPEC',format=str(len(spectra))+'D'
 									)]))
-
 			indiv_noise_hdu = fits.BinTableHDU.from_columns(
 									fits.ColDefs([
 									fits.Column(
 									array = noise.T,
 									name='VAR',format=str(len(noise))+'D' 
 									)]))
-
 			hdul_indiv = fits.HDUList([indiv_primary_hdu,
 										indiv_spectra_hdu,
 										indiv_noise_hdu])
@@ -2225,21 +777,16 @@ def make_spectra_tables(parameterfile):
 									array = logRebin_spectra.T,
 									name='SPEC',format=str(len(logRebin_spectra))+'D' 
 									)]))
-
 			logRebin_noise_hdu = fits.BinTableHDU.from_columns(
 									fits.ColDefs([
 									fits.Column(
 									array = logRebin_noise.T,
 									name='VAR',format=str(len(logRebin_noise))+'D'
 									)]))
-
-
 			hdul_logRebin = fits.HDUList([logRebin_primary_hdu,
 											logRebin_spectra_hdu,
 											logRebin_noise_hdu])
 
-
-			
 			print("Saving log-rebinnned indiv. spectra table")
 			sys.stdout.flush()
 			hdul_logRebin.writeto(f"{parameters['output']}/indiv/logRebin_spectra.fits",overwrite=True)
@@ -2249,244 +796,23 @@ def make_spectra_tables(parameterfile):
 			hdul_logRebin = None
 			sys.stdout.flush()
 
-
-
-
-
-		print('Extracting testcube of 20K spectra')
-		sys.stdout.flush()
-
-		index_cen_xx = int(Nx*0.5)
-		index_cen_yy = int(Ny*0.5)
-
-		yy_num = int(2.e4 / index_cen_xx)
-		xx_edge = int(Nx)
-		yy_edge = int(index_cen_yy + yy_num)
-
-		index_xx = [index_cen_xx,xx_edge]
-		index_yy = [index_cen_yy,yy_edge]
-
-
-		testcube = extract_subcube(parameters['datacube'],["all",index_xx,index_yy],hdu=1)
-		
-		data_testcube = testcube.unmasked_data[:].value
-		data_header = testcube.header
-
-		testcube = extract_subcube(parameters['datacube'],["all",index_xx,index_yy],hdu=2)
-		
-		noise_testcube = testcube.unmasked_data[:].value
-		noise_header = testcube.header
-
-		data_testcube = np.swapaxes(data_testcube,1,2)
-		noise_testcube = np.swapaxes(noise_testcube,1,2)
-
-
-		hdu0 = fits.PrimaryHDU(header=fits.Header())
-		hdu1 = fits.ImageHDU(data_testcube,header=data_header)
-		hdu2 = fits.ImageHDU(noise_testcube,header=noise_header)
-
-		hdul = fits.HDUList([hdu0,hdu1,hdu2])
-		hdul.writeto(f"{parameters['output']}/testcube/testcube.fits",overwrite=True)
-
-
-		# spax_xx_testcube, spax_yy_testcube = np.meshgrid(np.arange(index_cen_xx,index_edge_xx))
-
-		spec_nums = [(yy-1)*Nx + (xx-1) for xx in range(index_cen_xx,xx_edge) for yy in range(index_cen_yy,yy_edge)]
-		spec_nums = np.sort(spec_nums)
-
-		testcube_locs = np.in1d(spax_properties['spax_num'][:],spec_nums)
-
-		spax_properties_testcube = spax_properties[testcube_locs]
-		# spax_properties_testcube['spax_num'] = np.arange(len(spax_properties_testcube))[testcube_locs]
-		# print(spax_properties_testcube['spax_num'])
-		NX =  np.abs(index_xx[1] - index_xx[0])
-		NY = np.abs(index_yy[1] - index_yy[0])
-		spax_properties_testcube['spax_xx'] -= index_cen_xx -1
-		spax_properties_testcube['spax_yy'] -= index_cen_yy -1
-		spax_properties_testcube['spax_num'] = (spax_properties_testcube['spax_yy']-1)*NX + (spax_properties_testcube['spax_xx']-1)
-		spax_properties_testcube.meta['NX'] = NX
-		spax_properties_testcube.meta['NY'] = NY
-
-		print("Saving testcube individual spaxel properties")
-		sys.stdout.flush()
-		#save individual spaxel properties
-		spax_properties_testcube.write(f"{parameters['output']}/testcube/spaxel_properties.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-
-		spectra_testcube = spectra[:,testcube_locs]
-		noise_testcube = noise[:,testcube_locs]
-
-		logRebin_spectra_testcube = logRebin_spectra[:,testcube_locs]
-		logRebin_noise_testcube = logRebin_noise[:,testcube_locs]
-
-
-		#save individual testcube spectra
-		indiv_header = fits.Header()
-		indiv_header['COMMENT'] = "A.B. Watts"
-		indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
-											header = indiv_header)
-
-		indiv_spectra_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = spectra_testcube.T,
-								name='SPEC',format=str(len(spectra))+'D'
-								)]))
-
-		indiv_noise_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = noise_testcube.T,
-								name='VAR',format=str(len(noise))+'D' 
-								)]))
-
-		hdul_indiv = fits.HDUList([indiv_primary_hdu,
-									indiv_spectra_hdu,
-									indiv_noise_hdu])
-		print("Saving indiv. testcube spectra table")
-		sys.stdout.flush()
-		hdul_indiv.writeto(f"{parameters['output']}/testcube/spectra_indiv.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-		
-		#save log-rebinned individual testcube spectra
-		logRebin_header = fits.Header()
-		logRebin_header['velscale'] = velscale
-		logRebin_header['COMMENT'] = "A.B. Watts"
-
-		logRebin_primary_hdu = fits.PrimaryHDU(data = logLambda,
-												header = logRebin_header)
-		logRebin_spectra_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = logRebin_spectra_testcube.T,
-								name='SPEC',format=str(len(logRebin_spectra))+'D' 
-								)]))
-
-		logRebin_noise_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = logRebin_noise_testcube.T,
-								name='VAR',format=str(len(logRebin_noise))+'D'
-								)]))
-
-
-		hdul_logRebin = fits.HDUList([logRebin_primary_hdu,
-										logRebin_spectra_hdu,
-										logRebin_noise_hdu])
-		
-		print("Saving log-rebinnned indiv. testcube spectra table")
-		sys.stdout.flush()
-		hdul_logRebin.writeto(f"{parameters['output']}/testcube/logRebin_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-
-
-
-		print("Extracting and saving 5 test spectra across cube")
-		sys.stdout.flush()
-
-		SNsort = np.argsort(np.array(spax_properties['spax_signal_cont'])/np.array(spax_properties['spax_noise_cont']))
-		SN_ids = [SNsort[-1],
-				SNsort[int(len(SNsort)*0.9)],
-				SNsort[int(len(SNsort)*0.8)],
-				SNsort[int(len(SNsort)*0.7)],
-				SNsort[int(len(SNsort)*0.5)]]
-
-		locs = [[int(spax_properties['spax_xx'][ii]),int(spax_properties['spax_yy'][ii])]
-					for ii in SN_ids]
-
-		spax_properties_test = spax_properties[SN_ids]
-		spax_properties_test['spax_num'] = np.arange(len(spax_properties_test),dtype=int)
-		spax_properties_test['vorbin_num'] = np.arange(len(spax_properties_test),dtype=int)
-		spax_properties_test.meta['NX'] = len(SN_ids)
-		spax_properties_test.meta['NY'] = 1
-
-		
-		print("Saving test individual spaxel properties")
-		sys.stdout.flush()
-		spax_properties_test.write(f"{parameters['output']}/test/spaxel_properties.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-
-		spectra_test = spectra[:,SN_ids]
-		noise_test = noise[:,SN_ids]
-
-		logRebin_spectra_test = logRebin_spectra[:,SN_ids]
-		logRebin_noise_test = logRebin_noise[:,SN_ids]
-
-
-
-		#save individual test spectra
-		indiv_header = fits.Header()
-		indiv_header['COMMENT'] = "A.B. Watts"
-		indiv_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
-											header = indiv_header)
-
-		indiv_spectra_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = spectra_test.T,
-								name='SPEC',format=str(len(spectra))+'D'
-								)]))
-
-		indiv_noise_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = noise_test.T,
-								name='VAR',format=str(len(noise))+'D' 
-								)]))
-
-		hdul_indiv = fits.HDUList([indiv_primary_hdu,
-									indiv_spectra_hdu,
-									indiv_noise_hdu])
-		print("Saving indiv. test spectra table")
-		sys.stdout.flush()
-		hdul_indiv.writeto(f"{parameters['output']}/test/spectra_indiv.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-		
-		#save log-rebinned individual test spectra
-		logRebin_header = fits.Header()
-		logRebin_header['velscale'] = velscale
-		logRebin_header['COMMENT'] = "A.B. Watts"
-
-		logRebin_primary_hdu = fits.PrimaryHDU(data = logLambda,
-												header = logRebin_header)
-		logRebin_spectra_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = logRebin_spectra_test.T,
-								name='SPEC',format=str(len(logRebin_spectra))+'D' 
-								)]))
-
-		logRebin_noise_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = logRebin_noise_test.T,
-								name='VAR',format=str(len(logRebin_noise))+'D'
-								)]))
-
-
-		hdul_logRebin = fits.HDUList([logRebin_primary_hdu,
-										logRebin_spectra_hdu,
-										logRebin_noise_hdu])
-		
-		print("Saving log-rebinnned indiv. test spectra table")
-		sys.stdout.flush()
-		hdul_logRebin.writeto(f"{parameters['output']}/test/logRebin_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
 	comm.barrier()
 
 def read_spectra_hdul(hdul):
+	"""
+	Read 2D spectral tables
+	Parameters
+	----------
+	hdul : HDUL
+		fits HDU list
 
+	Returns
+	-------
+	wave : array
+		Wavelength array
+	spectra : 2-list
+		List containing spectra and noise 
+	"""
 	wave = np.asarray(hdul[0].data)
 	spectra = []
 	for hdu in hdul[1::]:
@@ -2494,81 +820,98 @@ def read_spectra_hdul(hdul):
 
 	return wave, spectra
 
+
 def voronoi_bin_cube(parameterfile):
+	"""
+	Perform voronoi spatial binning
+	Parameters
+	----------
+	parameterfile : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing 
+		Outputs are written to file
+	"""
+	
+	#Ensure if run in MPI mode that only the head node handles this
 	comm = MPI.COMM_WORLD
 	rank = comm.Get_rank()
 	nproc = comm.Get_size()
 
 	if rank == 0:
+		#Get parameter file and pixel properties
 		parameters = read_parameterfile(parameterfile)
-
 		spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-		SN_indiv = parameters['vorbin_SNmin']
-		SN_vorbin = parameters['vorbin_SNtarget']
+		spax_properties = Table.read(spax_prop_file)
 
 		if not os.path.isdir(f"{parameters['output_dir']}/"):
 			os.mkdir(f"{parameters['output_dir']}/")
 			os.mkdir(f"{parameters['output_dir']}/figures")
 
-		spax_properties = Table.read(spax_prop_file)
-		spax_size = 1 #spax_properties.meta['D_SPAX'] * 3600.
-
-		# #value for where specta don't make min SN cut
+		#Value for where spectra don't make the min SN cut
 		spax_properties['vorbin_num'] =  np.full(len(spax_properties),-1)
 		spax_properties['vorbin_xx'] = np.full(len(spax_properties),-1)
 		spax_properties['vorbin_yy'] = np.full(len(spax_properties),-1)
 		spax_properties['vorbin_SN'] = np.full(len(spax_properties),-1)
 
-		#currently not saving non-observed spectra
-		# #value for where spectra are not observed
-		# spax_properties['vorbin_num'][spax_properties['obs_flag'][:] == 0] = -99
-		# spax_properties['vorbin_xx'][spax_properties['obs_flag'][:] == 0] = -99
-		# spax_properties['vorbin_yy'][spax_properties['obs_flag'][:] == 0] = -99
-		# spax_properties['vorbin_SN'][spax_properties['obs_flag'][:] == 0] = -99
+		#Voronoi binning parameters
+		spax_size = 1
+		SN_indiv = parameters['vorbin_SNmin']
+		SN_vorbin = parameters['vorbin_SNtarget']
 
-		SNnames = parameters['vorbin_SNname']
+		#Include an additional spatial mask to avoid areas with, e.g. lots of sky or very very little galaxy
+		if not isinstance(parameters['spatial_mask'],type(None)):
+			with fits.open(parameters['spatial_mask']) as hdul: mask = hdul[1].data.flatten()
+			mask = mask[np.asarray(spax_properties['spax_num'].data,dtype=int)]
+			spax_properties['spatial_mask'] = np.full(len(spax_properties),0)
+			spax_properties['spatial_mask'][np.isfinite(mask)] = mask[np.isfinite(mask)]
+		else:
+			mask = np.ones(len(spax_properties))
 
-		if len(SNnames) == 1:
-
-			#get spaxels above desired SN
-			spax_SN = spax_properties[f'spax_signal_{SNnames[0]}'] /  spax_properties[f'spax_noise_{SNnames[0]}']
-
-			refs = np.where(spax_SN >= SN_indiv)[0]
-
-			spax_xx = spax_properties['spax_xx'][refs]
-			spax_yy = spax_properties['spax_yy'][refs]
-			spax_signal = spax_properties[f'spax_signal_{SNnames[0]}'][refs]
-			spax_noise = spax_properties[f'spax_noise_{SNnames[0]}'][refs]
-
-			sn_func = None
-		elif len(SNnames) > 1:
-
-			refs =  np.arange(len(spax_properties),dtype=int)
+		#Read emission line fluxes if available
+		if os.path.isfile(f"{parameters['input_dir']}/spax_emline_fluxes.fits"):
 			spax_emline_fluxes = Table.read(f"{parameters['input_dir']}/spax_emline_fluxes.fits")
 
-			# spax_properties_temp = hstack((spax_properties,spax_emline_fluxes))
-			spax_xx = np.full([len(SNnames),len(spax_properties)],spax_properties['spax_xx']).T
-			spax_yy = np.full([len(SNnames),len(spax_properties)],spax_properties['spax_yy']).T
+		#Select what propeties to bin on, e.g. starts, Halpha, [OIII]
+		SNnames = parameters['vorbin_SNname']
+		spax_signal = np.zeros([len(spax_properties),len(SNnames)])
+		spax_noise = np.zeros([len(spax_properties),len(SNnames)])
+		spax_xx = np.full([len(SNnames),len(spax_properties)],spax_properties['spax_xx'].data).T
+		spax_yy = np.full([len(SNnames),len(spax_properties)],spax_properties['spax_yy'].data).T
 
-			spax_signal = np.zeros([len(spax_properties),len(SNnames)])
-			spax_noise = np.zeros([len(spax_properties),len(SNnames)])
+		#Loop over SN properties and set values for non-detected data
+		for nn, name in enumerate(SNnames):
+			if name ==  "cont" :
+				spax_signal[:,nn] = spax_properties[f'spax_signal_{name}'].data
+				spax_noise[:,nn] = spax_properties[f'spax_noise_{name}'].data
+
+			else:
+				spax_signal[:,nn] = spax_emline_fluxes[f'{name}'].data
+				spax_noise[:,nn] = spax_emline_fluxes[f'{name}_err'].data
+
+				spax_signal[spax_signal[:,nn]==-99,nn] =  0.5*spax_noise[spax_signal[:,nn]==-99,nn]
+
+		#Only bin pixels above minimum SN value
+		spax_SN = np.nanmin(spax_signal / spax_noise,axis=1)
+		refs = np.logical_and(spax_SN >= SN_indiv, mask==1)
 		
-
-			for nn, name in enumerate(SNnames):
-				if name ==  "cont" :
-					spax_signal[:,nn] = spax_properties[f'spax_signal_{name}']
-					spax_noise[:,nn] = spax_properties[f'spax_noise_{name}']
-
-				else:
-					spax_signal[:,nn] = spax_emline_fluxes[f'{name}']
-					spax_noise[:,nn] = spax_emline_fluxes[f'{name}_err']
-
-					spax_signal[spax_signal[:,nn]==-99,nn] =  spax_noise[spax_signal[:,nn]==-99,nn]
-					# spax_noise[spax_noise[:,nn]==0,nn] =  noise_median
-
+		if len(SNnames) > 1: 			#Modified binning function if enfocing a bin S/N in more than one property	
 			sn_func = voronoi_multiSN_function
+			spax_signal = spax_signal[refs,:]
+			spax_noise = spax_noise[refs,:]
+			spax_xx = spax_xx[refs,:]
+			spax_yy = spax_yy[refs,:]
+		else:
+			sn_func = None
+			spax_signal = spax_signal[refs].flatten()
+			spax_noise = spax_noise[refs].flatten()
+			spax_xx = spax_xx[refs].flatten()
+			spax_yy = spax_yy[refs].flatten()
 
 
+				
 
 		#compute Voronoi bins
 		print('Computing voronoi bins')
@@ -2580,286 +923,173 @@ def voronoi_bin_cube(parameterfile):
 											plot = False,
 											sn_func = sn_func,
 											quiet=True)
-		# vorbin_nums, Nxx, Nyy, vorbin_xx, vorbin_yy, vorbin_SN, vorbin_Npix, scale = \
-		# 				voronoi_2d_binning(spax_xx, spax_yy, 
-		# 									spax_signal, spax_noise, 
-		# 									SN_vorbin, pixelsize=spax_size,
-		# 									plot = False,
-		# 									sn_func = sn_func,
-		# 									quiet=True)
 
-
-		#record vorbin properties for each spaxel
+		#Record vorbin properties for each spaxel
 		spax_properties['vorbin_num'][refs] = vorbin_nums
-		# spax_properties['vorbin_xx'][spax_SN >= SN_indiv] = vorbin_xx
-		# spax_properties['vorbin_yy'][spax_SN >= SN_indiv] = vorbin_yy
-		# spax_properties['vorbin_SN'][spax_SN >= SN_indiv] = vorbin_SN
+		spax_properties['vorbin_signal'] = np.full(len(spax_properties),-1)
+
+		#Distribute properites into pixel table
 		for vv, num in enumerate(np.sort(np.unique(vorbin_nums))):
+			inbin = np.in1d(spax_properties['vorbin_num'].data, num)
+			spax_properties['vorbin_xx'][inbin] =\
+												vorbin_xx[vv]
 
-			spax_properties['vorbin_xx'][vorbin_nums == num] =\
-																			vorbin_xx[vv]
+			spax_properties['vorbin_yy'][inbin] =\
+												vorbin_yy[vv]
 
-			spax_properties['vorbin_yy'][vorbin_nums == num] =\
-																			vorbin_yy[vv]
-
-			spax_properties['vorbin_SN'][vorbin_nums == num] =\
-																			vorbin_SN[vv]
-
-		# spax_properties = spax_properties[spax_properties.argsort(spax_properties['vorbin_num'])]
-		spax_properties.write(f"{parameters['output_dir']}/spaxel_properties.fits",overwrite=True)
-
-		create_binned_spectra(parameters)
-		make_vorbins_map(parameters)
-	comm.barrier()
-
-def voronoi_subbin_cube(parameterfile):
-	comm = MPI.COMM_WORLD
-	rank = comm.Get_rank()
-	nproc = comm.Get_size()
-
-	if rank == 0:
-		parameters = read_parameterfile(parameterfile)
-
-		spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-		SN_indiv = parameters['vorbin_SNmin']
-		SN_vorbin = parameters['vorbin_SNtarget']
-		SNnames = parameters['vorbin_SNname']
-
-
-		if not os.path.isdir(f"{parameters['output_dir']}/"):
-			os.mkdir(f"{parameters['output_dir']}/")
-			os.mkdir(f"{parameters['output_dir']}/figures")
-
-		spax_properties = Table.read(spax_prop_file)
-		spax_size = 1 #spax_properties.meta['D_SPAX'] * 3600.
-
-		spax_emline_fluxes = Table.read(f"{parameters['input_dir']}/spax_emline_fluxes.fits")
-
-		vorbin_nums = np.unique(np.asarray(spax_properties['vorbin_num']))
-
-		vorbin_new = np.full(len(spax_properties),-1)
-		vorbin_xx_new = np.full(len(spax_properties),-1)
-		vorbin_yy_new = np.full(len(spax_properties),-1)
-		vorbin_SN_new = np.full(len(spax_properties),-1)
-
-		unique_check1 = 0
-		unique_check2 = 0
-
-		N_unbinned = 0
-		N_rebinned = 0
-
-		subvorbin_max = 0
-		for vv, vb in enumerate(vorbin_nums):
-			# print(f"Rebinning {vv+1} out of {len(vorbin_nums)}")
-
-			inbin = np.where(spax_properties['vorbin_num'][:] == vb)[0]
-
-			spax_xx = spax_properties['spax_xx'][inbin]
-			spax_yy = spax_properties['spax_yy'][inbin]
-			signal = spax_emline_fluxes[f'{SNnames[0]}'][inbin]
-			noise = spax_emline_fluxes[f'{SNnames[0]}_err'][inbin]
-			signal[signal==-99] = noise[signal==-99]
-
-
-			try:
-				subvorbin_nums, Nxx, Nyy, vorbin_xx, vorbin_yy, vorbin_SN, vorbin_Npix, scale = \
-				voronoi_2d_binning(spax_xx, spax_yy, signal, noise, 
-									SN_vorbin, pixelsize=1,
-									plot = False,
-									sn_func = None,
-									quiet=True)
-				# plt.show()
-				N_rebinned +=len(inbin)
-			except:
-				# print("all spaxels above threshold")
-				N_unbinned +=len(inbin)
-				subvorbin_nums = np.arange(len(inbin),dtype=int)
-				vorbin_xx = spax_properties['vorbin_xx'][inbin]
-				vorbin_yy = spax_properties['vorbin_yy'][inbin]
-				vorbin_SN = spax_properties['vorbin_SN'][inbin]
-			
-			unique_check1 += len(np.unique(subvorbin_nums))
-
-			subvorbin_nums = subvorbin_nums + subvorbin_max
-			subvorbin_max = np.max(subvorbin_nums)+1
-
-
-			vorbin_new[inbin] = subvorbin_nums
-
-			for ss, sb in enumerate(np.unique(subvorbin_nums)):
-				vorbin_xx_new[vorbin_new==sb] = vorbin_xx[ss]
-				vorbin_yy_new[vorbin_new==sb] = vorbin_yy[ss]
-				vorbin_SN_new[vorbin_new==sb] = vorbin_SN[ss]
-
-
-
-		unique_check2 = len(np.unique(vorbin_new))
-		print("numbers should match",unique_check1,unique_check2)
-		print(N_rebinned,"spaxels rebinned",N_unbinned,"spaxels left unbinned")
-		sys.stdout.flush()
-
-		spax_properties['vorbin_num_old'] = spax_properties['vorbin_num']
-		spax_properties['vorbin_xx_old'] = spax_properties['vorbin_xx']
-		spax_properties['vorbin_yy_old'] = spax_properties['vorbin_yy']
-		spax_properties['vorbin_SN_old'] = spax_properties['vorbin_SN']
-
-		spax_properties['vorbin_num'] = vorbin_new
-		spax_properties['vorbin_xx'] = vorbin_xx_new
-		spax_properties['vorbin_yy'] = vorbin_xx_new
-		spax_properties['vorbin_SN'] = vorbin_SN_new
-
-		spax_properties.meta['vb_input'] = f"{SNnames[0]}"
+			spax_properties['vorbin_SN'][inbin] =\
+												vorbin_SN[vv]
+			spax_properties['vorbin_signal'][inbin] =\
+												np.nansum(spax_signal[np.in1d(vorbin_nums,num)])
 
 		spax_properties.write(f"{parameters['output_dir']}/spaxel_properties.fits",overwrite=True)
 
-		create_binned_spectra(parameters)
+		#Make binned spectra
+		create_binned_spectra(parameters, contsub=parameters['binned_contsub'])
+		#Plot map of spatial bin
 		make_vorbins_map(parameters)
 	comm.barrier()
-
-
-	
 
 def voronoi_multiSN_function(index, signal =  None, noise = None):
+	"""
+	Custom function for computing the S/N for mulitple properties (e.g., stars, Halpha) and returning the minimum
+	Parameters
+	----------
+	index : array size N
+		Array of intergers of values to combine
+	signal : array size m x N
+		Array of signal values for m properties
+	noise : array size m x N
+		Array or noise values for m properies
 
-	if signal.ndim ==1:
+	Returns
+	-------
+	sn : float
+		Minimum S/N across m properties
+		
+	"""
+	if signal.ndim ==1:			#Single property case
 		sn = np.sum(signal[index]) / np.sqrt(np.sum(noise**2))
 
-
-	elif signal.ndim > 1:
-		# print(signal)
-
-		# print(noise)
-		# print('flag')
-		# print(signal.ndim)
-		# print(signal.shape)
-		# print(signal[index])
-		# print(noise[index])
-		# exit()
-		if isinstance(index,int) or isinstance(index,np.int64) or len(index)==1:
+	elif signal.ndim > 1:		#Multiple properties case
+		if isinstance(index,int) or isinstance(index,np.int64) or len(index)==1:	#single pixel case
 			SN = signal[index,:] / np.sqrt(noise[index,:]**2)
-			# print('flag1')
-
 
 		elif len(index)>1:
 			SN = np.sum(signal[index,:],axis = 0) / np.sqrt(np.sum(noise[index,:]**2,axis = 0))
-			# print('flag2')
 
 		sn = np.min(SN)
-			# print(SN)
-			# print(sn)
-			# exit()
-	# exit()
-
 
 	return sn
 
-def create_binned_spectra(parameters = None):
+def create_binned_spectra(parameters = None, contsub=False):
+	"""
+	Co-adds spectra based on spatial bins
+	
+	Parameters
+	----------
+	parameters : dict 
+		Dictionary of parameters
+	contsub : bool
+		Flag to identify if the spectra being co-added are already log-rebinned
 
-	if parameters is None:
+	Returns
+	-------
+	Nothing
+		Outputs are saved to file
+		
+	"""
+
+	if parameters is None:						#Default parameter file
 		parameters = read_parameterfile()
 
-	# print(parameters)
+	#Read pixel properties
 	spax_prop_file = f"{parameters['output_dir']}/spaxel_properties.fits"
-	
 	spax_properties = Table.read(spax_prop_file)
 
-	# spectra_file = parameters['vorbin_spectra_file']
-	# if isinstance(spectra_file,type(None)):
-	spectra_file = f"{parameters['input_dir']}/spectra_indiv.fits"
+	#Read input spectra
+	if contsub:
+		spectra_file = f"{parameters['input_dir']}/logRebin_contsub_spectra.fits"
+	else:
+		spectra_file = f"{parameters['input_dir']}/spectra_indiv.fits"
 
 	hdul = fits.open(spectra_file)
 	header = hdul[0].header
-	#is there a faster way to read these?
 	linLambda_obs, spectra_list = read_spectra_hdul(hdul)
 	hdul.close()
 	spectra = spectra_list[0]
 	noise = spectra_list[1]
-	# varbin_flag = True
-	# else:
-	# 	hdul = fits.open(spectra_file)
-	# 	header = hdul[0].header
-	# 	#is there a faster way to read these?
-	# 	linLambda_obs, spectra_list = read_spectra_hdul(hdul)
-	# 	spectra = spectra_list[0]
-	# 	varbin_flag = False
-	# 	# print(header)
-	
-	# if "logRebin" in spectra_file:				#you're summing something already log-rebinned, like a cont. sub. cube
-	# 	logRebin_flag = False
-	# else:
-	# 	logRebin_flag = True
+	if contsub:
+		logLambda_obs = linLambda_obs
+		with fits.open(f"{parameters['output']}/indiv/logRebin_spectra.fits") as hdul: header1 =hdul[0].header
+		velscale = header1['VELSCALE']
 
-
-
+	#Get bin numbers
 	vorbin_nums = np.unique(spax_properties['vorbin_num'])
 	vorbin_nums = np.sort(vorbin_nums[vorbin_nums >= 0])
 
-
-	# if logRebin_flag:
-
+	#Make binned spectra arrays
 	vorbin_spectra = np.zeros([len(spectra),len(vorbin_nums)])
 	vorbin_noise = copy.deepcopy(vorbin_spectra)
 
-	for nn in vorbin_nums:
+	#Loop over bins and sum spectra and noise in each bin
+	for vb in vorbin_nums:
+		inbin = np.in1d(spax_properties['vorbin_num'][:], vb)
+		if not contsub:
+			vorbin_spectra[:,vb] = np.sum(spectra[:,inbin], axis=1)
+			vorbin_noise[:,vb] = np.sqrt(np.sum(noise[:,inbin]**2, axis=1))
+		elif contsub:
+			vorbin_spectra[:,vb] = np.sum(spectra[:,inbin], axis=1)
+			vorbin_noise[:,vb] = np.sqrt(np.sum(noise[:,inbin]**2, axis=1))
 
-		inbin = np.in1d(spax_properties['vorbin_num'][:], nn)
 
-		vorbin_spectra[:,nn] = np.sum(spectra[:,inbin], axis=1)
-		vorbin_noise[:,nn] = np.sqrt(np.sum(noise[:,inbin]**2, axis=1))
+	#Save native resoltuion binned spectra
+	if not contsub:
+		vorbin_header = fits.Header()
+		vorbin_header['COMMENT'] = "A.B. Watts"
+		vorbin_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
+												header = vorbin_header)
 
-	# else:
-	# 	logRebin_vorbin_spectra = np.zeros([len(spectra),len(vorbin_nums)])
-	# 	for nn in vorbin_nums:
-	# 		inbin = np.where(spax_properties['vorbin_num'][:] == nn)[0]
-	# 		logRebin_vorbin_spectra[:,nn] = np.sum(spectra[:,inbin], axis=1)
-	# 	logLambda = linLambda_obs
+		vorbin_spectra_hdu = fits.BinTableHDU.from_columns(
+								fits.ColDefs([
+								fits.Column(
+								array = vorbin_spectra.T,
+								name='SPEC',format=str(len(vorbin_spectra))+'D'
+								)]))
+		hdul_vorbin = fits.HDUList([vorbin_primary_hdu,
+									vorbin_spectra_hdu])
 
-	# if logRebin_flag:
-		#save vorbin spectra
-	vorbin_header = fits.Header()
-	vorbin_header['COMMENT'] = "A.B. Watts"
-	vorbin_primary_hdu = fits.PrimaryHDU(data = linLambda_obs,
-											header = vorbin_header)
+		vorbin_noise_hdu = fits.BinTableHDU.from_columns(
+								fits.ColDefs([
+								fits.Column(
+								array = vorbin_noise.T,
+								name='VAR',format=str(len(vorbin_noise))+'D' 
+								)]))
+		hdul_vorbin.append(vorbin_noise_hdu)
+		
 
-	vorbin_spectra_hdu = fits.BinTableHDU.from_columns(
-							fits.ColDefs([
-							fits.Column(
-							array = vorbin_spectra.T,
-							name='SPEC',format=str(len(vorbin_spectra))+'D'
-							)]))
-	hdul_vorbin = fits.HDUList([vorbin_primary_hdu,
-								vorbin_spectra_hdu])
+		print("Saving vorbin. spectra table")
+		hdul_vorbin.writeto(f"{parameters['output_dir']}/spectra_vorbin.fits",overwrite=True)
+		print("Saved")
 
-	# if varbin_flag:
-	vorbin_noise_hdu = fits.BinTableHDU.from_columns(
-							fits.ColDefs([
-							fits.Column(
-							array = vorbin_noise.T,
-							name='VAR',format=str(len(vorbin_noise))+'D' 
-							)]))
-	hdul_vorbin.append(vorbin_noise_hdu)
-	
-
-	print("Saving vorbin. spectra table")
-	hdul_vorbin.writeto(f"{parameters['output_dir']}/spectra_vorbin.fits",overwrite=True)
-	print("Saved")
-
-	logRebin_vorbin_spectra, logLambda, velscale = pputils.log_rebin(linLambda_obs,
-																vorbin_spectra)
-	
-	# if varbin_flag:
-	logRebin_vorbin_noise, logLambda1, velscale1 = pputils.log_rebin(linLambda_obs,
-																vorbin_noise)
+	#Log-rebin binned spectra if needed
+	if not contsub:
+		logRebin_vorbin_spectra, logLambda_obs, velscale = pputils.log_rebin(linLambda_obs,
+																	vorbin_spectra)
+		logRebin_vorbin_noise, logLambda_obs1, velscale1 = pputils.log_rebin(linLambda_obs,
+																	vorbin_noise)
+	elif contsub:
+		logRebin_vorbin_spectra = vorbin_spectra
+		logRebin_vorbin_noise = vorbin_noise
 
 	if isinstance(velscale,type(np.array([]))):
 		velscale = velscale[0]
 
-	#save log-rebinned vorbin spectra
+	#Save log-rebinned vorbin spectra
 	logRebin_vorbin_header = fits.Header()
-	# logRebin_vorbin_header['VELSCALE'] = velscale
 	logRebin_vorbin_header['VELSCALE'] = velscale
 	logRebin_vorbin_header['COMMENT'] = "A.B. Watts"
-	logRebin_vorbin_primary_hdu = fits.PrimaryHDU(data=logLambda,
+	logRebin_vorbin_primary_hdu = fits.PrimaryHDU(data=logLambda_obs,
 												header = logRebin_vorbin_header)
 	logRebin_vorbin_spectra_hdu = fits.BinTableHDU.from_columns(
 							fits.ColDefs([
@@ -2869,7 +1099,6 @@ def create_binned_spectra(parameters = None):
 							)]))
 	hdul_logRebin_vorbin = fits.HDUList([logRebin_vorbin_primary_hdu,
 								logRebin_vorbin_spectra_hdu])
-	# if varbin_flag:
 	logRebin_vorbin_noise_hdu = fits.BinTableHDU.from_columns(
 							fits.ColDefs([
 							fits.Column(
@@ -2877,15 +1106,32 @@ def create_binned_spectra(parameters = None):
 							name='VAR',format=str(len(logRebin_vorbin_noise))+'D' 
 							)]))
 
-	
+
 	hdul_logRebin_vorbin.append(logRebin_vorbin_noise_hdu)
 	print("Saving log-rebinnned. vorbin spectra table")
-	hdul_logRebin_vorbin.writeto(f"{parameters['output_dir']}/logRebin_spectra.fits",overwrite=True)
+	if not contsub:
+		hdul_logRebin_vorbin.writeto(f"{parameters['output_dir']}/logRebin_spectra.fits",overwrite=True)
+	elif contsub:
+		hdul_logRebin_vorbin.writeto(f"{parameters['output_dir']}/logRebin_contsub_spectra.fits",overwrite=True)
+
 	print("Saved")
 
 def get_bin_properties(parameters):
-	spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
+	"""
+	Reads the spaxel properties file and adds redshift to the parameter dictionary
+	Parameters
+	----------
+	parameters : dict 
+		Dictionary of parameters
 
+	Returns
+	-------
+	spax_properties
+		Table of spaxel properties
+		
+	"""
+
+	spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
 	spax_properties = Table.read(spax_properties_file)
 	parameters['z'] = spax_properties.meta['Z']
 
@@ -2893,13 +1139,31 @@ def get_bin_properties(parameters):
 
 
 def get_spectra_to_fit(parameters):
+	"""
+	Reads the log-rebinned spectra and noise and adds VELSCALE to the parameter dictionary
+	
+	Parameters
+	----------
+	parameters : dict 
+		Dictionary of parameters
+
+	Returns
+	-------
+	logLambda_spec : array 1xN
+		log-spaced spectral axis vector
+	logRebin_spectra : array NxS
+		Array of log-rebinned spectra, one spectrum per column
+	logRebin_noise : array
+		Array of log-rebinned noise vectors, one per column
+		
+	"""
 	spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
 
 	hdul = fits.open(spectra_file)
 	logLambda_spec, spectra  = read_spectra_hdul(hdul)
 	logRebin_spectra = spectra[0]
 	logRebin_noise = spectra[1]
-	spectra = None
+	spectra = None					#Free up memory
 
 	header = hdul[0].header
 	hdul.close()
@@ -2909,135 +1173,406 @@ def get_spectra_to_fit(parameters):
 	return logLambda_spec,logRebin_spectra,logRebin_noise
 
 def distribute_save_outputs(parameters,spax_properties,logLambda_spec,outputs_all):
-
-		moments_list = ['V','sigma','h3','h4','h5','h6']
-		stars_kin_names = [f'{k}_stellar{ee}'  for k in moments_list[:parameters['stars_moments']] for ee in ['','_err']] 
-		gas_kin_names = [f'{k}_gas_C{ii+1}{ee}' for ii in range(len(parameters['gas_Ncomp'])) for k in ['V','sigma'] for ee in ['','_err']]
-		gas_flux_names = [f'{ll}_flux{ee}' for ll in parameters['gas_names'] for ee in ['','err']]
-
-		names = ['chi2'] + stars_kin_names + gas_kin_names + gas_flux_names		 
-
-		kin_fluxes = np.full([len(spax_properties),len(names)],np.nan)
-
-		bestfit_stars = np.zeros(parameters['spectra_shape'])
-		bestfit_gas = np.zeros(parameters['spectra_shape'])
-		template_weights = np.empty((templates.shape[1],parameters['spectra_shape'][1]))
-		apy = np.empty(parameters['spectra_shape'])
-		mpy = np.empty(parameters['spectra_shape'])
-
-		
-		for out in outputs_all:
-			vorbin_num = out[0]
-			chi2 = out[1]
-			kin = np.hstack(out[2])
-			err = np.hstack(out[3])*np.sqrt(chi2)
-			if isinstance(gas_components,type(None)):
-				gas_flux =  np.array([])
-				gas_flux_err =  np.array([])
-			else:
-				gas_flux = out[4]
-				gas_flux_err = out[5]*np.sqrt(chi2)
-
-			kin_err = np.full(1+len(kin)+len(err),None)
-			kin_err[0] = chi2
-			kin_err[1::2] = kin
-			kin_err[2::2] = err
-
-			flux_err = np.full(len(gas_flux)+len(gas_flux_error),None)
-			flux_err[::2] = gas_flux
-			flux_err[1::2] = gas_flux_err
-
-
-			ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0]
-			kin_fluxes[ref,:] = np.hstack((kin_err,flux_err))
-			bestfit_stars[:,vorbin_num] = np.array(out[6])
-			bestfit_gas[:,vorbin_num] = np.array(out[7])
-
-
-			template_weights[:,vorbin_num] = out[8]
-			apy[:,vorbin_num] = out[9]
-			mpy[:,vorbin_num] = out[10]
-
-		
-		if not os.path.isdir(f"{parameters['output_dir']}"):
-			os.mkdir(f"{parameters['output_dir']}")
-			os.mkdir(f"{parameters['output_dir']}/figures")
-		
-
-		kin_fluxes = Table(kin_fluxes,names=names)
-		print("Saving bestfit kinematics and fluxes table")
-		sys.stdout.flush()
-		kin_fluxes.write(f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits",overwrite=True)
-
-		header["COMMENT1"] = "Best fit weights for bins"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		weights_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = template_weights.T,
-								name='weights',format=str(len(template_weights))+'D'
-								)]))
-
-		apoly_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = apy.T,
-								name='apoly',format=str(len(apy))+'D'
-								)]))
-
-		mpoly_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = mpy.T,
-								name='mpoly',format=str(len(mpy))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,weights_hdu,apoly_hdu, mpoly_hdu])		
-		hdul.writeto(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
-
-
-
-		header["COMMENT1"] = "Best fit stellar spectra for bins"
-		primary_hdu = fits.PrimaryHDU(data = logLambda_spec,header = header)
-
-		bestfit_stars_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_stars.T,
-								name='BESTSTARS',format=str(len(bestfit_stars))+'D'
-								)]))
-		bestfit_gas_hdu = fits.BinTableHDU.from_columns(
-								fits.ColDefs([
-								fits.Column(
-								array = bestfit_gas.T,
-								name='BESTGAS',format=str(len(bestfit_gas))+'D'
-								)]))
-
-		hdul = fits.HDUList([primary_hdu,
-							bestfit_stars_hdu,bestfit_gas_hdu])
-		print("Saving best fit spectra table")
-		sys.stdout.flush()
-		hdul.writeto(f"{parameters['output_dir']}/logRebin_bestfit_spectra.fits",overwrite=True)
-		print("Saved")
-		sys.stdout.flush()
-
-###
-
-
-###template stuff
-def read_EMILES():
-	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/EMILES"
-
-	files = glob.glob(template_dir + "/*")
-
-	# template_params = np.array([[],[],[]])
-	template_params = []
-
-	params = ["ch","Z","T","_iTp","_"]
-
-	for ff in range(len(files)):
+	"""
+	Distributes fit parameters into the pixel table and saves best fit spectra outputs
 	
+	Parameters
+	----------
+	parameters : dict 
+		Dictionary of parameters
+	spax_properties : astropy.Table 
+		Table of pixel properties
+	logLambda_spec : array 
+		Spectral axis of the observed data in log-rebin
+	outputs_all : list 
+		List of pPXF outputs
+
+	Returns
+	-------
+	Nothing
+		Outputs are saved to disc
+		
+	"""
+
+	#Names of possible kinematic moments
+	moments_list = ['V','sigma','h3','h4','h5','h6']
+
+	#Column names of stellar kinematics and gas outputs
+	stars_kin_names = [f'{k}_stellar{ee}'  for k in moments_list[:parameters['stars_moments']] for ee in ['','_err']] 
+	gas_kin_names = [f'{k}_gas_C{ii+1}{ee}' for ii in range(len(parameters['gas_Ncomp'])) for k in ['V','sigma'] for ee in ['','_err']]
+	gas_flux_names = [f'{ll}_flux{ee}' for ll in parameters['gas_names'] for ee in ['','err']]
+
+	#Total name list and array to hold all data
+	names = ['chi2'] + stars_kin_names + gas_kin_names + gas_flux_names		 
+	kin_fluxes = np.full([len(spax_properties),len(names)],np.nan)
+
+	#Arrays to hold bestfit spectra outputs and polynomials
+	bestfit_stars = np.zeros(parameters['spectra_shape'])
+	bestfit_gas = np.zeros(parameters['spectra_shape'])
+	template_weights = np.empty((parameters['templates_shape'][1],parameters['spectra_shape'][1]))
+	apy = np.empty(parameters['spectra_shape'])
+	mpy = np.empty(parameters['spectra_shape'])
+
+	
+	for out in outputs_all:											#Loop over outputs
+		vorbin_num = out[0]
+		ref = np.where(spax_properties['vorbin_num'][:] == vorbin_num)[0]	#Find all pixels in this bin 
+		chi2 = out[1]
+		kin = np.hstack(out[2])
+		err = np.hstack(out[3])*np.sqrt(chi2)						#Scale error by chi squared as instructed by pPXF
+		if isinstance(parameters['gas_components'],type(None)):		#Handle inclusion of gas emission lines
+			gas_flux =  np.array([])
+			gas_flux_err =  np.array([])
+		else:
+			gas_flux = out[4]
+			gas_flux_err = out[5]*np.sqrt(chi2)
+
+		kin_err = np.full(1+len(kin)+len(err),None)					#Populate the array with output fit values
+		kin_err[0] = chi2
+		kin_err[1::2] = kin
+		kin_err[2::2] = err
+
+		flux_err = np.full(len(gas_flux)+len(gas_flux_err),None)
+		flux_err[::2] = gas_flux
+		flux_err[1::2] = gas_flux_err
+
+
+		kin_fluxes[ref,:] = np.hstack((kin_err,flux_err))				#Distribute fit values to pixel table
+
+		
+
+		bestfit_stars[:,vorbin_num] = np.array(out[6])						#Save bestfit spectra
+		bestfit_gas[:,vorbin_num] = np.array(out[7])
+		template_weights[:,vorbin_num] = out[8]
+		apy[:,vorbin_num] = out[9]
+		mpy[:,vorbin_num] = out[10]
+
+	
+	if not os.path.isdir(f"{parameters['output_dir']}"):					#Make folders if they dont exist
+		os.mkdir(f"{parameters['output_dir']}")
+		os.mkdir(f"{parameters['output_dir']}/figures")
+	
+	kin_fluxes = Table(kin_fluxes,names=names)
+	print("Saving bestfit kinematics and fluxes table")
+	sys.stdout.flush()
+	kin_fluxes.write(f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits",overwrite=True)
+
+	#Save fit weights and polynomials
+	primary_hdu = fits.PrimaryHDU(data = logLambda_spec)
+	primary_hdu.header["COMMENT1"] = "Best fit weights for bins"
+
+	weights_hdu = fits.BinTableHDU.from_columns(
+							fits.ColDefs([
+							fits.Column(
+							array = template_weights.T,
+							name='weights',format=str(len(template_weights))+'D'
+							)]))
+	apoly_hdu = fits.BinTableHDU.from_columns(
+							fits.ColDefs([
+							fits.Column(
+							array = apy.T,
+							name='apoly',format=str(len(apy))+'D'
+							)]))
+	mpoly_hdu = fits.BinTableHDU.from_columns(
+							fits.ColDefs([
+							fits.Column(
+							array = mpy.T,
+							name='mpoly',format=str(len(mpy))+'D'
+							)]))
+	hdul = fits.HDUList([primary_hdu,weights_hdu,apoly_hdu, mpoly_hdu])		
+	hdul.writeto(f"{parameters['output_dir']}/bestfit_weights.fits",overwrite=True)
+
+
+	#Save bestfit spectra
+	primary_hdu = fits.PrimaryHDU(data = logLambda_spec)
+	primary_hdu.header["COMMENT1"] = "Best fit spectra for bins"
+	bestfit_stars_hdu = fits.BinTableHDU.from_columns(
+							fits.ColDefs([
+							fits.Column(
+							array = bestfit_stars.T,
+							name='BESTSTARS',format=str(len(bestfit_stars))+'D'
+							)]))
+	bestfit_gas_hdu = fits.BinTableHDU.from_columns(
+							fits.ColDefs([
+							fits.Column(
+							array = bestfit_gas.T,
+							name='BESTGAS',format=str(len(bestfit_gas))+'D'
+							)]))
+
+	hdul = fits.HDUList([primary_hdu,
+						bestfit_stars_hdu,bestfit_gas_hdu])
+	print("Saving best fit spectra table")
+	sys.stdout.flush()
+	hdul.writeto(f"{parameters['output_dir']}/logRebin_bestfit_spectra.fits",overwrite=True)
+	print("Saved")
+	sys.stdout.flush()
+
+
+
+### Template functions
+
+def get_templates(parameters):
+	"""
+	Gets all templates
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	logLambda_templates : array
+		log-rebinned spectral axis
+	templates : array
+		Column vectors of all templates
+	components : array
+		List of numbers indicating kinematic components each template belongs to
+	gas_components
+		List of numbers indicating gas line components
+
+	"""
+
+	logLambda_templates, templates = get_stellar_templates(parameters)		#Get stellar templates
+	components_stars = [0]*len(templates[0,:])
+
+
+	if not isinstance(parameters['gas_groups'],type(None)):
+		gas_templates = make_gas_templates(parameters,logLambda_templates)		#Get gas templates
+		templates = np.column_stack((templates,gas_templates))
+
+		components_gas = [[nn + 1 + components_stars[-1]]*NN for nn,NN in enumerate(parameters['gas_Ncomp'])]
+		components_gas = [comp for group in components_gas for comp in group]
+		components = components_stars + components_gas
+
+		gas_components = np.array(components) > components_stars[-1]
+	else:
+		components = components_stars
+		gas_components = None
+
+
+	return logLambda_templates, templates, components, gas_components
+
+def get_stellar_templates(parameters, match_velscale=True, convolve = True, regrid=False):
+	"""
+	Reads chosen spectral templates, convolve to match the same resoltuion as the data
+	
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+	match_velscale : bool
+		Optionally match the template velocity scale to the same, or a multiple of, the data
+	convolve : bool
+		Smooth the templates to match the spectral resolution of the data
+	regrid : bool
+		Shape the templates into a grid for regularised fitting. 
+
+	Returns
+	-------
+	logLambda_templates : array
+		Log-rebinned spectral axis of the templates
+	stellar_templates_final : 2- or 3-D array 
+		Log-rebinned and convolved stellar templates 
+
+	"""
+	
+	if parameters is None:						#Load default parameter file
+		parameters = read_parameterfile()
+
+	#Choose which set of templates to load
+	if "EMILES" in parameters['stellar_templates']:
+		stellar_templates, linLambda_templates, wave_step  = read_EMILES()
+		FWHM_template = np.full_like(linLambda_templates,2.51)				#FWHM of EMILES templates is 2.51A
+
+	elif "MILES" in parameters['stellar_templates']:
+		stellar_templates, linLambda_templates, wave_step  = read_MILES()
+		FWHM_template = np.full_like(linLambda_templates,2.51)				#FWHM of EMILES templates is 2.51A
+
+	elif "BPASS" in parameters['stellar_templates']:
+		if parameters['stellar_templates'].split('-')[0] == parameters['stellar_templates']:
+			mode = None
+		else:
+			mode = parameters['stellar_templates'].split('-')[-1]
+		stellar_templates, linLambda_templates, wave_step  = read_BPASS(mode=mode)
+		FWHM_template = np.full_like(linLambda_templates,0)					#FWHM of BPASS is 0 as theoretical
+
+	#Optionally convolve templates
+	stellar_templates_conv = np.zeros_like(stellar_templates)
+	for tt in range(stellar_templates.shape[1]):
+		template = stellar_templates[:,tt]
+
+		if convolve:
+			FWHM_galaxy = MUSE_LSF_Bacon17(linLambda_templates,z = parameters['z'])		#Get MUSE resolution
+			FWHM_diffs = np.sqrt(FWHM_galaxy**2.e0 - FWHM_template**2.e0 )				#Difference of sigmas
+			FWHM_diffs[np.isfinite(FWHM_diffs)==False] = 1.e-3
+			stddev_diffs = FWHM_diffs / (wave_step  * 2.355)					#VARSMOOTH TAKES UNITS OF WAVELENGTH, NOT PIXELS
+			stellar_templates_conv[:,tt] = pputils.varsmooth(linLambda_templates,template,stddev_diffs)
+		else:
+			stellar_templates_conv[:,tt] = template
+
+	#Keep only templates where everyything is finite
+	stellar_templates_conv = stellar_templates_conv[:,np.where(np.prod(np.isfinite(stellar_templates_conv),axis=0)==1)[0]]
+
+	if match_velscale:			#Optionally elocity resolution match to data or up sample
+		template_velscale = parameters['galaxy_velscale'] / parameters['velscale_ratio']
+	else:
+		template_velscale = None
+
+	#log-rebin templates
+	stellar_templates_logRebin, logLambda_templates, temp_velscale = pputils.log_rebin(linLambda_templates,
+															stellar_templates_conv,
+															velscale = template_velscale)
+
+
+	if not regrid: 				#Light-weighted, normalise each by themself
+		stellar_templates_final = stellar_templates_logRebin
+		stellar_templates_final /= np.median(stellar_templates_final,axis=0)
+
+	elif regrid:				#Mass-weighted, normalise by median of all templates and resort into alpha x Z x Age grid
+		stellar_templates_final = np.full([len(stellar_templates_logRebin[:,0]),
+											Nages,
+											NZs,
+											Nalphas],np.nan)
+		for tt in range(len(stellar_templates_logRebin[0,:])):
+			age_loc = np.where(Ages == template_params[tt,0])[0][0]
+			Z_loc = np.where(Zs == template_params[tt,1])[0][0]
+			alpha_loc = np.where(Alphas == template_params[tt,2])[0][0]
+			
+			stellar_templates_final[:,age_loc,Z_loc,alpha_loc] = stellar_templates_logRebin[:,tt]
+		stellar_templates_final /= np.median(stellar_templates_final)
+
+	return logLambda_templates, stellar_templates_final
+
+def MUSE_LSF_Bacon17(ll, z = 0):
+	"""
+	Returns redshift-corrected linespread function for MUSE
+	
+	Parameters
+	----------
+	ll : float/array
+		wavelength in Angstroms
+	z : float
+		redshift
+
+	Returns
+	-------
+	FWHM : float/array
+		FWHM at wavelength ll in Angstroms, corrected for redshift
+		
+	"""
+	ll = ll*(1.e0 + z)										#convert rest-frame wavelength to observed frame
+	FWHM = 5.866e-8 * ll*ll - 9.187e-4 * ll + 6.040 		#get LSF at observed-frame wavelength
+	FWHM = FWHM / (1.e0 + z)								#convert obs-frame LSF to narrower de-redshifted value
+
+	return FWHM
+def read_EMILES():
+	"""
+	Reads EMILES spectral templates from a directory, which should be in the same level as this file
+	
+	Parameters
+	----------
+	Nothing
+
+	Returns
+	-------
+	templates : array
+		Stellar templates sorted as column vectors
+	linLambda_templates_trunc : array
+		Linear spectral axis of the templates
+	wave_step : float
+		wavelength channel resolution
+		
+	"""
+
+	#Identify template files
+	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/EMILES"
+	files = sorted(glob.glob(template_dir + "/*"))
+	
+	params = ["ch","Z","T","_iTp","_"] 				#Possible template parameters to identify
+	template_params = []
+	for ff in range(len(files)):					#Loop over files to get the parameters
+	
+		#Split filename to get parameters
+		a = [files[ff].split("/")[-1].split(params[p],maxsplit=1)[1].split(params[p+1],maxsplit=1)[0]
+						for p in range(len(params)-1)]	
+
+		IMF = float(a[0])
+		Z = a[1]
+		if Z[0] == "p":
+			Z = float(Z[1::])
+		elif Z[0] == "m":
+			Z = -1.e0*float(Z[1::])
+		age = float(a[2])
+		alpha = float(a[3])
+
+		template_params.append([age,Z,alpha])
+	template_params = np.array(template_params)
+
+	temp_sort = np.lexsort((template_params[:,2],		#Sort by alpha, then Z, then age
+							template_params[:,1],
+							template_params[:,0]))
+	template_params = template_params[temp_sort]
+	files = np.array(files)[temp_sort]
+	
+	Ages = np.unique(template_params[:,0])
+	Nages = len(Ages)
+	Zs = np.unique(template_params[:,1])
+	NZs = len(Zs)
+	Alphas = np.unique(template_params[2])
+	Nalphas = len(Alphas)
+
+	for ff in range(len(files)):						#Read templates in sorted order
+		file = files[ff]
+		hdu = fits.open(file)
+		template = hdu[0].data
+		header = hdu[0].header
+		hdu.close()
+
+		if ff == 0:										#Get spectral parameters from first template
+			wave_step = header['CDELT1']
+			lambda0 = header['CRVAL1']
+			linLambda_templates = lambda0 + np.arange(header['NAXIS1'])*header['CDELT1']
+			templates = np.zeros([header['NAXIS1'],len(files)])
+			templates = templates[(linLambda_templates>=4000) & (linLambda_templates<10000),:]			#We arent covering more than this range
+			
+			linLambda_templates_trunc = linLambda_templates[(linLambda_templates>=4000) & (linLambda_templates<10000)]
+
+		
+		template = template[(linLambda_templates>=4000) & (linLambda_templates<10000)]
+
+		templates[:,ff] =  template
+
+	return templates, linLambda_templates_trunc, wave_step
+
+def read_MILES():
+	"""
+	Reads MILES spectral templates from a directory, which should be in the same level as this file
+	
+	Parameters
+	----------
+	Nothing
+
+	Returns
+	-------
+	templates : array
+		Stellar templates sorted as column vectors
+	linLambda_templates_trunc : array
+		Linear spectral axis of the templates
+	wave_step : float
+		wavelength channel resolution
+		
+	"""
+
+	#Identify template files
+	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/MILES"
+	files = sorted(glob.glob(template_dir + "/*"))
+
+
+	params = ["ch","Z","T","_iTp","_"] 				#Possible template parameters to identify
+	template_params = []
+	for ff in range(len(files)):					#Loop over files to get the parameters
+		#Split filename to get parameters
 		a = [files[ff].split("/")[-1].split(params[p],maxsplit=1)[1].split(params[p+1],maxsplit=1)[0]
 						for p in range(len(params)-1)]
 
@@ -3053,7 +1588,7 @@ def read_EMILES():
 		template_params.append([age,Z,alpha])
 	template_params = np.array(template_params)
 
-	temp_sort = np.lexsort((template_params[:,2],
+	temp_sort = np.lexsort((template_params[:,2],	#Sort by alpha, then Z, then age
 							template_params[:,1],
 							template_params[:,0]))
 	template_params = template_params[temp_sort]
@@ -3066,10 +1601,7 @@ def read_EMILES():
 	Alphas = np.unique(template_params[2])
 	Nalphas = len(Alphas)
 
-	
-
-
-	for ff in range(len(files)):
+	for ff in range(len(files)):					#Read templates in sorted order
 
 		file = files[ff]
 		hdu = fits.open(file)
@@ -3077,66 +1609,83 @@ def read_EMILES():
 		header = hdu[0].header
 		hdu.close()
 
-		if ff == 0:
+		if ff == 0:									#Get spectral parameters from first template
 			wave_step = header['CDELT1']
 			lambda0 = header['CRVAL1']
 			linLambda_templates = lambda0 + np.arange(header['NAXIS1'])*header['CDELT1']
 			templates = np.zeros([header['NAXIS1'],len(files)])
-			templates = templates[(linLambda_templates>=4000) & (linLambda_templates<10000),:]
+			templates = templates[(linLambda_templates>=4000) & (linLambda_templates<7300),:]
 			
-			linLambda_templates_trunc = linLambda_templates[(linLambda_templates>=4000) & (linLambda_templates<10000)]
+			linLambda_templates_trunc = linLambda_templates[(linLambda_templates>=4000) & (linLambda_templates<7300)]
 
-		
-		template = template[(linLambda_templates>=4000) & (linLambda_templates<10000)]
+		template = template[(linLambda_templates>=4000) & (linLambda_templates<7300)]
 
 		templates[:,ff] =  template
 
 	return templates, linLambda_templates_trunc, wave_step
 
-def read_XSL():	
-	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}/templates/XSL_sorted"
-
-	files = glob.glob(template_dir + "/*X064*")
-
-	for ff in range(len(files)):
-
-		file = files[ff]
-		hdu = fits.open(file)
-		data = hdu[1].data
-		header = hdu[1].header
-		hdu.close()
-
-		linLambda_templates = np.array(data.field(0))*10.
-		template = np.array(data.field(2))
-		# err = np.array(data.field(3))
-		wave_step = np.diff(linLambda_templates)
-		wave_step = wave_step[(linLambda_templates[0:-1]>=4000) & (linLambda_templates[0:-1]<10000)]
-
-
-		if ff == 0:
-			
-			templates = np.zeros([len(linLambda_templates),len(files)])			
-			templates = templates[(linLambda_templates>=4000) & (linLambda_templates<10000),:]
-			linLambda_templates_trunc = linLambda_templates[(linLambda_templates>=4000) & (linLambda_templates<10000)]
-
-		
-		template = template[(linLambda_templates>=4000) & (linLambda_templates<10000)]
-
-		templates[:,ff] =  template
-
-	
-
-	return  templates, linLambda_templates_trunc,  wave_step, files
-
-def read_BPASS():
+def read_BPASS(mode = None):
+	"""
+	Need to document!
+	"""
 	template_dir = f"{os.path.dirname(os.path.realpath(__file__))}//templates/BPASS"
 
-	files = glob.glob(template_dir + "/*")
-	# print(files)
+	files = np.array(glob.glob(template_dir + "/*"))
+	Zs = np.zeros(len(files))
+	for ff, file in enumerate(files):
+		z = file.split('.dat')[0].split('.z')[-1]
+		if 'em' in z:
+			z = z.split('em')[-1]
+			z = 1.*10**(-1*float(z))
+		else:
+			z = 1.e-3 * float(z)
+		Zs[ff] = z
+	files = files[Zs.argsort()]
+	Zs = Zs[Zs.argsort()]
+	alphas = np.zeros(len(Zs))
+	agesAll = np.arange(6,11.1,0.1)
+	agesFlags = (agesAll<=10.2)
+
 
 	wave_step = 1
 
-	ages = np.arange(6,11.1,0.1)
+	if isinstance(mode,type(None)):
+		mode = 'short'		
+
+	if mode == 'emshort':
+		agesList = np.array([7.4,7.6,7.8,8,9.2,9.5,9.7,9.9,10.2])
+		timeSteps = np.sum([np.isclose(agesAll,aa) for aa in agesList],axis=0,dtype=bool) * agesFlags 
+		zList = np.array([1.e-3,6.e-3,1.4e-2,4.e-2])
+		refs = np.sum([np.isclose(Zs,zz) for zz in zList],axis=0,dtype=bool)
+		files = files[refs]
+		Zs = Zs[refs]
+		alphas = alphas[refs]
+		ages = agesAll[timeSteps]
+
+	if mode == 'short':
+		timeSteps = ~np.array((np.arange(len(agesAll)))%2,dtype=bool) * agesFlags		#0.2dex age steps
+		zList = np.array([1.e-3,6.e-3,1.4e-2,4.e-2])
+		refs = np.sum([np.isclose(Zs,zz) for zz in zList],axis=0,dtype=bool)
+		files = files[refs]
+		Zs = Zs[refs]
+		alphas = alphas[refs]
+		ages = agesAll[timeSteps]
+
+	if mode == 'pops':
+		timeSteps = ~np.array((np.arange(len(agesAll)))%2,dtype=bool)					#0.2dex age steps
+		zList = np.array([1.e-4,1.e-3,2.e-3,4.e-3,8.e-3,1.4e-2,2.e-2,4.e-2])
+		refs = np.sum([np.isclose(Zs,zz) for zz in zList],axis=0,dtype=bool)
+		files = files[refs]
+		Zs = Zs[refs]
+		alphas = alphas[refs]
+		ages = agesAll[timeSteps]
+
+	elif mode == 'full':
+		timeSteps = np.array(np.ones(len(ages)),dtype=bool) * agesFlags					#0.1dex age steps
+
+	timeSteps = np.append(np.array([False]),timeSteps)
+
+	Nspec = len(ages)
 
 	for ff in range(len(files)):
 
@@ -3149,261 +1698,81 @@ def read_BPASS():
 			wave_shorten = np.logical_and((linLambda_templates>=4000), (linLambda_templates<10000))
 
 			linLambda_templates_trunc = linLambda_templates[wave_shorten]
-			templates = np.zeros([linLambda_templates_trunc.shape[0],51*len(files)])
+			templates = np.zeros([linLambda_templates_trunc.shape[0],Nspec*len(files)])
 
-
-		templates[:,ff*51:(ff+1)*51] = data[wave_shorten,1::]
+		templates[:,ff*Nspec:(ff+1)*Nspec] = data[wave_shorten,:][:,timeSteps]
 
 
 
 	return  templates, linLambda_templates_trunc,  wave_step
 
-def get_stellar_templates(parameters, match_velscale=True, convolve = True, regrid=False):
-
-	if parameters is None:
-		parameters = read_parameterfile()
-
-	if parameters['stellar_templates'] == "EMILES":
-		stellar_templates, linLambda_templates, wave_step  = read_EMILES()
-		FWHM_template = np.full_like(linLambda_templates,2.51)
-
-
-	if parameters['stellar_templates'] == "XSL":
-		stellar_templates, linLambda_templates, wave_step,files  = read_XSL()
-		# FWHM_template = np.zeros_like(linLambda_templates)
-	# 	UV_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	VIS_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	NIR_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	FWHHM_template[UV_range] = (13/c)
-	# 	11/c
-	# 	15/c
-
-	if parameters['stellar_templates'] == "BPASS":
-		stellar_templates, linLambda_templates, wave_step  = read_BPASS()
-		FWHM_template = np.full_like(linLambda_templates,0)
-
-
-	stellar_templates_conv = np.zeros_like(stellar_templates)
-	for tt in range(stellar_templates.shape[1]):
-		template = stellar_templates[:,tt]
-
-		if convolve:
-			FWHM_galaxy = MUSE_LSF_Bacon17(linLambda_templates,z = parameters['z'])
-			FWHM_diffs = np.sqrt(FWHM_galaxy**2.e0 - FWHM_template**2.e0 )
-			FWHM_diffs[np.isfinite(FWHM_diffs)==False] = 1.e-3
-
-			# stddev_diffs = FWHM_diffs / (wave_step  * 2.355)					###VARSMOOTH TAKES UNITS OF WAVELENGTH, NOT PIXELS
-			stddev_diffs = FWHM_diffs / (wave_step  * 2.355)
-
-			stellar_templates_conv[:,tt] = pputils.varsmooth(linLambda_templates,template,stddev_diffs)
-
-		else:
-			stellar_templates_conv[:,tt] = template
-
-		# template_conv = np.zeros(len(linLambda_templates))
-		# for ll in range(len(linLambda_templates)):
-		# 	template_temp = np.zeros(len(linLambda_templates))
-		# 	template_temp[ll] = template[ll]
-		# 	if np.isfinite(stddev_diffs[ll]):
-		# 		template_conv += ndimage.gaussian_filter1d(template_temp, stddev_diffs[ll])
-		# 	else:
-		# 		template_conv += template_temp
-		# if tt==14:
-			# plt.plot(template_conv)
-			# plt.show()
-			# exit()
-
-	stellar_templates_conv = stellar_templates_conv[:,np.where(np.prod(np.isfinite(stellar_templates_conv),axis=0)==1)[0]]
-
-	if match_velscale:
-		template_velscale = parameters['galaxy_velscale'] / parameters['velscale_ratio']
-	else:
-		template_velscale = None
-
-
-	stellar_templates_logRebin, logLambda_templates, temp_velscale = pputils.log_rebin(linLambda_templates,
-															stellar_templates_conv,
-															velscale = template_velscale)
-
-	if not regrid:
-		stellar_templates_final = stellar_templates_logRebin
-		stellar_templates_final /= np.median(stellar_templates_final,axis=0)
-
-	elif regrid:
-
-		stellar_templates_final = np.full([len(stellar_templates_logRebin[:,0]),
-											Nages,
-											NZs,
-											Nalphas],np.nan)
-
-
-		for tt in range(len(stellar_templates_logRebin[0,:])):
-			age_loc = np.where(Ages == template_params[tt,0])[0][0]
-			Z_loc = np.where(Zs == template_params[tt,1])[0][0]
-			alpha_loc = np.where(Alphas == template_params[tt,2])[0][0]
-			
-
-			stellar_templates_final[:,age_loc,Z_loc,alpha_loc] = stellar_templates_logRebin[:,tt]
-			
-		stellar_templates_final /= np.median(stellar_templates_final)
-
-
-	return logLambda_templates, stellar_templates_final
-
 def make_gas_templates(parameters, logLambda_templates, convolve = True, pixel = True):
-	
+	"""
+	Makes gas emission line templates
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+	logLambda_templates : array
+		Spectra axis of stellar templates
+	convolve : bool
+		Smooth the templates to match the spectral resolution of the data
+	pixel : bool
+		Implement pPXF's pixel integration 
+
+	Returns
+	-------
+	gas_templates : 2D array
+		Column vector of gas emission line templates
+
+	"""
+
 	gas_templates = []
 
-	if convolve:
+	if convolve:								#Get linespread function of the MUSE data
 		FWHM = lambda ll: MUSE_LSF_Bacon17(ll, parameters['z'])
 	else:
 		FWHM = 0
 
 	gas_groups = parameters['gas_groups']
-	for gg, group in enumerate(gas_groups):
+	for gg, group in enumerate(gas_groups):		#Loop over gas emission lines and lien groups
 		for gl, gas_line in enumerate(group):
 			gas_lambda = emlines[gas_line]['lambda']
 			gas_ratio = emlines[gas_line]['ratio']
-			
 			line_template = pputils.gaussian(logLambda_templates,
 												np.asarray(gas_lambda),
 												FWHM,
 												pixel = pixel) \
 												@ gas_ratio
-
 			gas_templates.append(line_template)
-
 	gas_templates = np.array(gas_templates).T
 
 	return gas_templates
 
-def get_templates(parameters):
-
-	logLambda_templates, templates = get_stellar_templates(parameters)
-	components_stars = [0]*len(templates[0,:])
-
-
-	if not isinstance(parameters['gas_groups'],type(None)):
-		gas_templates = make_gas_templates(parameters,logLambda_templates)
-		templates = np.column_stack((templates,gas_templates))
-
-		components_gas = [[nn + 1 + components_stars[-1]]*NN for nn,NN in enumerate(parameters['gas_Ncomp'])]
-		components_gas = [comp for group in components_gas for comp in group]
-		components = components_stars + components_gas
-
-		gas_components = np.array(components) > components_stars[-1]
-	else:
-		components = components_stars
-		gas_components = None
-
-
-	return logLambda_templates, templates, components, gas_components
-
-def get_stellar_templates_testing(parameters, match_velscale=True, convolve = True, logRebin = True, regrid=False):
-
-	if parameters is None:
-		parameters = read_parameterfile()
-
-	if parameters['stellar_templates'] == "EMILES":
-		stellar_templates, linLambda_templates, wave_step  = read_EMILES()
-		FWHM_template = np.full_like(linLambda_templates,2.51)
-
-
-	if parameters['stellar_templates'] == "XSL":
-		stellar_templates, linLambda_templates, wave_step,files  = read_XSL()
-		# FWHM_template = np.zeros_like(linLambda_templates)
-	# 	UV_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	VIS_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	NIR_range = np.logical_and(linLambda_templates>, linLambda_templates<)
-	# 	FWHHM_template[UV_range] = (13/c)
-	# 	11/c
-	# 	15/c
-
-	if parameters['stellar_templates'] == "BPASS":
-		stellar_templates, linLambda_templates, wave_step  = read_BPASS()
-		FWHM_template = np.full_like(linLambda_templates,1)
-
-
-	stellar_templates_conv = np.zeros_like(stellar_templates)
-	for tt in range(stellar_templates.shape[1]):
-		template = stellar_templates[:,tt]
-
-		if convolve:
-			FWHM_galaxy = MUSE_LSF_Bacon17(linLambda_templates,z = parameters['z'])
-			FWHM_diffs = np.sqrt(FWHM_galaxy**2.e0 - FWHM_template**2.e0 )
-			FWHM_diffs[np.isfinite(FWHM_diffs)==False] = 0.01
-
-			# stddev_diffs = FWHM_diffs / (wave_step  * 2.355)					###VARSMOOTH TAKES UNITS OF WAVELENGTH, NOT PIXELS
-			stddev_diffs = FWHM_diffs / (wave_step  * 2.355)
-
-			stellar_templates_conv[:,tt] = pputils.varsmooth(linLambda_templates,template,stddev_diffs)
-
-		else:
-			stellar_templates_conv[:,tt] = template
-
-		# template_conv = np.zeros(len(linLambda_templates))
-		# for ll in range(len(linLambda_templates)):
-		# 	template_temp = np.zeros(len(linLambda_templates))
-		# 	template_temp[ll] = template[ll]
-		# 	if np.isfinite(stddev_diffs[ll]):
-		# 		template_conv += ndimage.gaussian_filter1d(template_temp, stddev_diffs[ll])
-		# 	else:
-		# 		template_conv += template_temp
-		# if tt==14:
-			# plt.plot(template_conv)
-			# plt.show()
-			# exit()
-
-	stellar_templates_conv = stellar_templates_conv[:,np.where(np.prod(np.isfinite(stellar_templates_conv),axis=0)==1)[0]]
-
-	if match_velscale:
-		template_velscale = parameters['galaxy_velscale'] / parameters['velscale_ratio']
-	else:
-		template_velscale = None
-
-
-	if logRebin:
-		lambda_range = [np.min(linLambda_templates),np.max(linLambda_templates)]
-		stellar_templates_logRebin, logLambda_templates, temp_velscale = pputils.log_rebin(linLambda_templates,
-																stellar_templates_conv,
-																velscale = template_velscale)
-	else:
-		stellar_templates_logRebin = stellar_templates_conv
-		logLambda_templates = linLambda_templates
-
-
-	if not regrid:
-		stellar_templates_final = stellar_templates_logRebin
-		stellar_templates_final /= np.median(stellar_templates_final,axis=0)
-
-	elif regrid:
-
-		stellar_templates_final = np.full([len(stellar_templates_logRebin[:,0]),
-											Nages,
-											NZs,
-											Nalphas],np.nan)
-
-
-		for tt in range(len(stellar_templates_logRebin[0,:])):
-			age_loc = np.where(Ages == template_params[tt,0])[0][0]
-			Z_loc = np.where(Zs == template_params[tt,1])[0][0]
-			alpha_loc = np.where(Alphas == template_params[tt,2])[0][0]
-			
-
-			stellar_templates_final[:,age_loc,Z_loc,alpha_loc] = stellar_templates_logRebin[:,tt]
-			
-		stellar_templates_final /= np.median(stellar_templates_final)
-
-
-	return logLambda_templates, stellar_templates_final
-
 def create_spectrum_mask(logLambda, parameters):
+	"""
+	Make a list of spectrum channels that should be included in the fit
+
+	Parameters
+	----------
+	logLambda : array
+		Spectral axis
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	goodpix : array
+		Array of good pixels to be included in the fit
+
+	"""
 
 	goodpix = np.zeros_like(logLambda,dtype=bool)
 	z = parameters['z']
-	linLambda = np.exp(logLambda)
+	linLambda = np.exp(logLambda)					#convert to linear channels
 
-	width = 400. / c
+	width = 400. / c								#set the window to mask around lines
 
 	gas_fit = False
 	if not isinstance(parameters['gas_groups'],type(None)):
@@ -3411,15 +1780,11 @@ def create_spectrum_mask(logLambda, parameters):
 
 
 
-	#					OI 			OI 		OI 
-	sky = np.array([5577.338, 6300.304, 6363.78])/(1.e0+z)
-	#				weird sky feature?
-	# sk1 = np.array([5890.5])/(1.e0+z)
-	#									NaD 			CaT
-	absorption_lines = np.array([5889.95, 5895.92, 8498., 8542., 8662.]) 
-	if parameters['fit_CaT'] == True:
+	sky = np.array([5577.338, 6300.304, 6363.78])/(1.e0+z)					# OI sky emission lines
+																		
+	absorption_lines = np.array([5889.95, 5895.92, 8498., 8542., 8662.]) 	# Stellar absorpton lines that can have ISM contribution  NaD CaT
+	if parameters['fit_CaT'] == True:										#Remove masks if fitting the CaT triplet
 		absorption_lines = absorption_lines[:2]
-
 
 	if gas_fit:
 		emission_lines_fit = [line for group in parameters['gas_groups'] for line in group]
@@ -3427,16 +1792,14 @@ def create_spectrum_mask(logLambda, parameters):
 	else:
 		emission_lines_fit = None
 
-	emlines_temp = copy.deepcopy(emlines)
-	if parameters['fit_CaT'] == True:
+	emlines_temp = copy.deepcopy(emlines)									#List of emission lines to mask out
+	if parameters['fit_CaT'] == True:										#Dont mask emission lines that overlap with CaT if fitting it
 		del emlines_temp['Pa13']
 		del emlines_temp['Pa15']
 		del emlines_temp['Pa16']
 
-
 	emission_lines = np.array([])
-	for line in emlines_temp:
-
+	for line in emlines_temp:												#Loop over emission lines but don't mask regions we are fitting
 		if not gas_fit:
 			emission_lines = np.append(emission_lines,
 								np.array(emlines_temp[line]['lambda']))
@@ -3444,19 +1807,15 @@ def create_spectrum_mask(logLambda, parameters):
 			emission_lines = np.append(emission_lines,
 								np.array(emlines_temp[line]['lambda']))
 
-	lines = np.concatenate((emission_lines,absorption_lines,sky),axis=None)
-
-	in_spec = np.logical_and(lines>=np.min(linLambda), lines<=np.max(linLambda))
-	
+	lines = np.concatenate((emission_lines,absorption_lines,sky),axis=None)		#Combine all lines to mask
+	in_spec = np.logical_and(lines>=np.min(linLambda), lines<=np.max(linLambda))	#Only choose lines in the wavelength range
 	lines = lines[in_spec]
 	for line in lines:
 		min_Lambda = line - line*width
 		max_Lambda = line + line*width
-
 		goodpix += np.logical_and(linLambda>=min_Lambda, linLambda<= max_Lambda)
 	
-
-	#telluric feature
+	#Mask the telluric feature
 	min_Lambda = (7650 / (1+z)) * (1-2500/c) 
 	max_Lambda = (7650 / (1+z)) * (1+2500/c) 
 	goodpix += np.logical_and(linLambda>=min_Lambda, linLambda<= max_Lambda)
@@ -3466,52 +1825,49 @@ def create_spectrum_mask(logLambda, parameters):
 	return goodpix
 
 def get_constraints(parameters, spaxel_properties, vorbin_nums):
+	"""
+	Read kinematic constraints
 
-	# if 'gas_constraints' not in parameters.keys():
-	# 	# print('entering default dummy constraint')
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+	spaxel_properties : astropy.Table
+		Table of pixel properties
+	vorbin_nums : array
+		List of bin numbers
 
-	# 	# constr_kinem = {'A_ineq':[[0.,-1.,0.,0.]],'b_ineq':[0]}
-	# 	constr_kinem = None
-	# elif parameters['gas_constraints']['A_ineq'] == []:
-	# 		# print('entering default dummy constraint')
-	# 		# constr_kinem = {'A_ineq':[[0.,-1.,0.,0.] + [0.,0.]*len(parameters['gas_groups'])],'b_ineq':[0]}
-	# 		constr_kinem = None
+	Returns
+	-------
+	start : list
+		List of fit input starting guesses
+	moments : list
+		List of kinematic moments to fit for each kinematic component
+	constraints : dict
+		Dictionary of kinematic constraints
+	"""
 
-	# else:
-		
-
-	# print(parameters['gas_constraints'])
-
-
+	#Read previously fit stellar kinematics if kinematics are being fixed
 	if 'stelkin_constr' in parameters.keys():
 		stel_kin_file = f"{parameters['output']}/{parameters['stelkin_constr']}/bestfit_kinematics_fluxes.fits"
 		stel_kin = Table.read(stel_kin_file)
-		# stel_kin_keys = stel_kin.keys()[1::]
-		# stel_kin_keys = stel_kin_keys[['err' not in key for key in stel_kin_keys]]
+		print('Found stelkin constraints...')
 	else:
 		stel_kin = None
-	# print(stel_kin)
 
 	constraints = []
 	start = []
 	moments = []
+	for vv, vb in enumerate(vorbin_nums):				#Loop over each spatial bin
 
-	for vv, vb in enumerate(vorbin_nums):
-
-		# if np.all(spax_properties['gas_Ncomp'][refs] == spax_properties['gas_Ncomp'][refs][0])  # for when I put gas Ncomp keywords in
-		
 		constr_kinem = {'A_ineq':[],'b_ineq':[]}
 
 		refs = np.where(spaxel_properties['vorbin_num'] == vb)[0]
 		fixed_flag = 0
 		if not isinstance(stel_kin,type(None)):
 			stel_kin_vorbin = stel_kin[refs]
-			# print(vb,'flag')
-			# maxmin = 
-			# for key in stel_kin_keys:
 
-
-			V_max =  np.max(stel_kin_vorbin['V_stellar'])
+			V_max =  np.max(stel_kin_vorbin['V_stellar'])				#Bound stellar kinematics by all pixel values in bin if e.g. you've re-binned on top of other data
 			V_min =  np.min(stel_kin_vorbin['V_stellar'])
 			sigma_max =  np.max(stel_kin_vorbin['sigma_stellar'])
 			sigma_min =  np.min(stel_kin_vorbin['sigma_stellar'])
@@ -3520,9 +1876,9 @@ def get_constraints(parameters, spaxel_properties, vorbin_nums):
 			h4_max =  np.max(stel_kin_vorbin['h4_stellar'])
 			h4_min =  np.min(stel_kin_vorbin['h4_stellar'])
 
+			#If max and min are the same fix the parameter, otherwise give reasonable bounds
 			fixed_flag = 0
-			if V_max != V_min:
-				print('getting V from different estimates',vb)
+			if V_max != V_min:			
 				if V_min == 0:
 					V_min -= 10
 				if V_max == 0:
@@ -3534,7 +1890,6 @@ def get_constraints(parameters, spaxel_properties, vorbin_nums):
 				constr_kinem['b_ineq'].extend( [ -1.e0* V_min / parameters['galaxy_velscale'] ])
 			else:
 				fixed_flag += 1
-				# print('V the same')
 			if sigma_max != sigma_min:
 				if sigma_min == 0:
 					sigma_min = 10
@@ -3546,274 +1901,164 @@ def get_constraints(parameters, spaxel_properties, vorbin_nums):
 				constr_kinem['b_ineq'].extend([ -1.e0* sigma_min / parameters['galaxy_velscale'] ])
 			else:
 				fixed_flag += 1
-				# print('sigma the same')
 			if h3_max != h3_min:
 				if h3_min == 0:
 					h3_min -= 2
 				if h3_max == 0:
 					h3_max += 2
-				# constr_kinem['A_ineq'].append([0,0,1,0] + [0,0]*len(parameters['gas_Ncomp']) )
-				# constr_kinem['b_ineq'].extend([ (h3_max+0.1) / parameters['galaxy_velscale'] ])
-				# constr_kinem['A_ineq'].append([0,0,-1,0] + [0,0]*len(parameters['gas_Ncomp']))
-				# constr_kinem['b_ineq'].extend([ -1.e0* (h3_min-0.1) / parameters['galaxy_velscale'] ])
 			else:
 				fixed_flag += 1
-				# print('h3 the same')
 			if h4_max != h4_min:
 				if h4_min == 0:
 					h4_min -= 2
 				if h4_max == 0:
 					h4_max += 2
-				# constr_kinem['A_ineq'].append([0,0,0,1] + [0,0]*len(parameters['gas_Ncomp']))
-				# constr_kinem['b_ineq'].extend([ h4_max / parameters['galaxy_velscale'] ])
-				# constr_kinem['A_ineq'].append([0,0,0,-1] + [0,0]*len(parameters['gas_Ncomp']) )
-				# constr_kinem['b_ineq'].extend([ -1.e0* h4_min / parameters['galaxy_velscale'] ])
 			else:
 				fixed_flag += 1
-				# print('h4 the same')
-
-
-			start_vorbin = [np.mean(stel_kin_vorbin['V_stellar']), np.mean(stel_kin_vorbin['sigma_stellar']),np.mean(stel_kin_vorbin['h3_stellar']),np.mean(stel_kin_vorbin['h4_stellar'])]
-
+			start_vorbin = [np.nanmean(stel_kin_vorbin['V_stellar']), np.nanmean(stel_kin_vorbin['sigma_stellar']),np.nanmean(stel_kin_vorbin['h3_stellar']),np.nanmean(stel_kin_vorbin['h4_stellar'])]
 		else:
 			start_vorbin = parameters['stars_start']
 
 
-
-		if not isinstance(parameters['gas_constraints'],type(None)):
+		if not isinstance(parameters['gas_constraints'],type(None)):		#Read gas parameter file constraints
 			gas_constraints = parameters['gas_constraints']
 			for aa in range(len(gas_constraints['A_ineq'])):
 				constr_kinem['A_ineq'].append( [0.,0.,0.,0.] + gas_constraints['A_ineq'][aa] )
 				constr_kinem['b_ineq'].extend( [ gas_constraints['b_ineq'][aa] / parameters['galaxy_velscale'] ])
 
-
-		if constr_kinem['A_ineq'] == []:
+		
+		if constr_kinem['A_ineq'] == []:									#Identify if no constraints are being used
 			constraints.append(None)
 		else:
-			# if len(constr_kinem['A_ineq']) == 1:
-				# constr_kinem['A_ineq'] = constr_kinem['A_ineq'][0]
 			constraints.append(constr_kinem)
 
-		#get starting estimates
-		# print(parameters['gas_Ncomp'])
+		#Get starting estimates
 		if len(parameters['gas_Ncomp'])>0:
 			start_vorbin = [start_vorbin] + [[0,50.]] 
 		if len(parameters['gas_Ncomp'])>1:
 			start_vorbin = start_vorbin + [[0,300]]*(len(parameters['gas_Ncomp'])-1)
-
 		start.append(start_vorbin)
 
+		#Combine all moments for the bin
 		moments_vorbin = [parameters['stars_moments']] + [2] * len(parameters['gas_Ncomp'])
-		if fixed_flag==4:
+		
+		if fixed_flag==4:			#Flag stellar kinematics as fixed
 			moments_vorbin[0] *= -1
 		moments.append(moments_vorbin)
 
-
-
-	# constr_kinem_spec = copy.deepcopy(constraints)
-	# if parameters['cont_stelkin_Vfrac'] != 1:
-	# 	# A_ineq = constraints['A_ineq']
-	# 	# b_ineq = constraints['b_ineq']
-	# 	if stel_kin['V_stellar'][vorbin_num] == 0:
-	# 		upper = 10 / parameters['galaxy_velscale']
-	# 		lower = -10 / parameters['galaxy_velscale']
-	# 	else:
-	# 		upper = stel_kin['V_stellar'][vorbin_num] * parameters['cont_stelkin_Vfrac'] / parameters['galaxy_velscale']
-	# 		lower = stel_kin['V_stellar'][vorbin_num] / parameters['cont_stelkin_Vfrac'] / parameters['galaxy_velscale']
-
-	# 	constr_kinem_spec['A_ineq'].append([1,0,0,0] + [0,0]*len(Ncomp_gas))
-	# 	constr_kinem_spec['b_ineq'].extend([upper])
-
-	# 	constr_kinem_spec['A_ineq'].append([-1,0,0,0] + [0,0]*len(Ncomp_gas))
-	# 	constr_kinem_spec['b_ineq'].extend([-lower])
-
-	# 	# constr_kinem_spec = {'A_ineq':A_ineq, 'b_ineq' : b_ineq}
-
-	# else:
-	# 	moments[0] = -moments[0]
-
-
+	print('Starting values and kinematic constraints created')
 
 	return start, moments, constraints
-###
-
-
-###making maps
-def make_vorbins_map(parameters):
-	spax_prop_file = f"{parameters['output_dir']}/spaxel_properties.fits"
-
-
-	spax_properties = Table.read(spax_prop_file)
-	meta = spax_properties.meta
-	NY = meta['NY']
-	NX = meta['NX']
-
-	img_grid = np.full([NY,NX],np.nan).flatten()
-	# print(np.asarray(spax_properties['spax_num'],dtype=int))
-	img_grid[np.asarray(spax_properties['spax_num'],dtype=int)] = spax_properties['vorbin_num']
-	img_grid = img_grid.reshape((NY,NX))
 
 
 
-	fig = plt.figure()
-	gs = gridspec.GridSpec(1,1)
 
-	ax = fig.add_subplot(gs[0,0])
-	ax.pcolormesh(img_grid,cmap='prism')
-	# ax.scatter(spax_properties['spax_xx'],spax_properties['spax_yy'],c=spax_properties['vorbin_num'])
-	# plt.show()
-	fig.savefig(f"{parameters['output_dir']}/figures/vorbin_map.pdf")
+##### Things for analysing outputs, not so much part of the main pipeline #####
 
-def make_stelkin_map(parameters):
-	spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-	fit_stellar_kinematics = f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits"
-
-	spax_properties = Table.read(spax_prop_file)
-	bestfit_stelkin = Table.read(fit_stellar_kinematics)
-
-
-	spax_properties = hstack((spax_properties,bestfit_stelkin))
-
-	meta = spax_properties.meta
-	NY = meta['NY']
-	NX = meta['NX']
-
-	img_grid = np.full([NY,NX],np.nan).flatten()
-	# print(np.asarray(spax_properties['spax_num'],dtype=int))
-
-	vorbin_nums = np.unique(spax_properties['vorbin_num'])
-	refs = np.zeros_like(vorbin_nums,dtype=int)
-	for vv, vb in enumerate(vorbin_nums):
-		refs[vv] = np.where(spax_properties['vorbin_num'] == vb)[0][0]
-
-
-	for comp in ['V_stellar','sigma_stellar','h3_stellar','h4_stellar']:
-
-
-		fig = plt.figure()
-		gs = gridspec.GridSpec(1,1)
-		ax = fig.add_subplot(gs[0,0])
-
-		img = copy.deepcopy(img_grid)
-		img[np.asarray(spax_properties['spax_num'],dtype=int)] = spax_properties[comp]
-		img = img.reshape((NY,NX))
-
-
-		if comp == 'V_stellar':
-			med_vel = np.nanmedian(spax_properties[comp][refs])
-			img -= med_vel
-			vmin = np.percentile(spax_properties[comp][refs]-med_vel,5)
-			vmax =np.percentile(spax_properties[comp][refs]-med_vel,95)
-			cmap = 'RdBu_r'
-
-			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
-
-		elif comp == 'sigma_stellar':
-			vmin = 0
-			# vmax = np.percentile(img[np.isfinite(img)].flatten(),84)
-			vmax = 60
-			cmap = 'inferno'
-
-			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
-
-		else:
-			vmin = 0.005
-			vmax = -0.005
-			cmap = 'inferno'
-			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax)
-
-		ax.set_aspect('equal')
-
-		fig.colorbar(iimmgg)
-		# ax.scatter(spax_properties['spax_xx'],spax_properties['spax_yy'],c=spax_properties['vorbin_num'])
-		# plt.show()
-		fig.savefig(f"{parameters['output_dir']}/figures/{comp}_map.pdf")
-		plt.close()
-###
-
-
-##### things for analysing outputs #####
 def make_continuum_subtracted_spectra(parameterfile):
+	"""
+	Subtracts the best fit spectra, where the fit is done on spatially binned data, from individual pixel spectra
 
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes spectra to file
+	"""
+
+	print("Doing continuum subtraction")
+	sys.stdout.flush()
+
+	#Read parameters and properties
 	parameters = read_parameterfile(parameterfile)
-
 	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 	Nx = spax_properties.meta['NX']
 	Ny = spax_properties.meta['NY']
 
-	spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
+	#Read observed and fit spectra
+	print("...Reading data")
+	sys.stdout.flush()
+	spectra_file = f"{parameters['output']}/indiv/logRebin_spectra.fits"
 	hdul = fits.open(spectra_file)
 	logLambda_obs, spectra = read_spectra_hdul(hdul)
 	hdul.close()
 	galaxy_spectra = spectra[0]
 	noise_spectra = spectra[1]
 
-
-	bestfit_continuum_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
+	bestfit_continuum_file = f"{parameters['output_dir']}/logRebin_bestfit_spectra.fits"
 	hdul = fits.open(bestfit_continuum_file)
 	logLambda_fit, spectra = read_spectra_hdul(hdul)
 	hdul.close()
 	bestfit_continuum = spectra[0]
-	# logLambda = np.log(logLambda)
-	galaxy_spectra = galaxy_spectra[np.logical_and(logLambda_obs>=logLambda_fit[0],
-									logLambda_obs<=logLambda_fit[-1])]
-	noise_spectra = noise_spectra[np.logical_and(logLambda_obs>=logLambda_fit[0],
-									logLambda_obs<=logLambda_fit[-1])]
+	spectra = None
 
-	contsub_spectra = galaxy_spectra - bestfit_continuum
-	logLambda_obs = logLambda_obs[np.logical_and(logLambda_obs>=logLambda_fit[0],
-									logLambda_obs<=logLambda_fit[-1])]
 
+	#Trim observed data to fit range
+	print("...Trimming data")
+	sys.stdout.flush()
+
+	galaxy_spectra = galaxy_spectra[np.asarray(logLambda_obs<=logLambda_fit[-1]),:]
+	noise_spectra = noise_spectra[np.asarray(logLambda_obs<=logLambda_fit[-1]),:]
+	logLambda_obs = logLambda_obs[np.asarray(logLambda_obs<=logLambda_fit[-1])]
+	linLambda_obs = np.exp(logLambda_obs)				#convert to linear spectral axis
+	print("...Done reading data")
+	sys.stdout.flush()
+
+
+	#Set up arrays for continuum subtracted data
 	Nl = logLambda_obs.shape[0]
+	contsub_cube = copy.deepcopy(np.zeros([Nl,Nx*Ny]))
+	contsub_spectra = np.zeros(galaxy_spectra.shape)
 
-	empty_cube = np.zeros([Nl,Nx*Ny])
+	#Propagate through pixels that were not fit
+	notBinned = np.where(spax_properties['vorbin_num'].data < 0)[0]
+	contsub_spectra[:,notBinned] = galaxy_spectra[:,notBinned]
 
-	galaxy_cube = copy.deepcopy(empty_cube)
-	noise_cube = copy.deepcopy(empty_cube)
-	continuum_cube = copy.deepcopy(empty_cube)
-	contsub_cube = copy.deepcopy(empty_cube)
+	#Define S/N range for rescaling spectra
+	SN_cont_Lmin = spax_properties.meta['SN_LMIN']
+	SN_cont_Lmax = spax_properties.meta['SN_LMAX']
+	SN_cont_Lrange = np.logical_and(linLambda_obs>=SN_cont_Lmin,linLambda_obs<=SN_cont_Lmax)
 
-
-	for vv in range(galaxy_spectra.shape[1]):
-		inbin = np.where(spax_properties['vorbin_num']==vv)[0]
-		spax_num_inbin = np.array(spax_properties['spax_num'][inbin],dtype=int)
+	print("...Looping over spectra")
+	sys.stdout.flush()
+	for vv in range(bestfit_continuum.shape[1]):			#Loop over bins
 		
-		galaxy_cube[:,spax_num_inbin] = np.full((len(inbin),Nl),galaxy_spectra[:,vv]).T
-		noise_cube[:,spax_num_inbin] = np.full((len(inbin),Nl),noise_spectra[:,vv]).T
-		continuum_cube[:,spax_num_inbin] = np.full((len(inbin),Nl),bestfit_continuum[:,vv]).T
-		contsub_cube[:,spax_num_inbin] =  np.full((len(inbin),Nl),contsub_spectra[:,vv]).T
+		fitSpec = bestfit_continuum[:,vv]
+		fitSignal = np.nanmedian(fitSpec[SN_cont_Lrange])
 
+		inbin = np.where(spax_properties['vorbin_num'].data == vv)[0]
 
-	# vorbin_nums = np.unique(spaxel_properties['vorbin_num'][:])
-	# vorbin_nums = vorbin_nums[vorbin_nums>=0]
-	# for bb in vorbin_nums:
-	# 	inbin = np.where(spaxel_properties['vorbin_num'][:] == bb)[0]
+		for ss in inbin:
+			obsSpec = galaxy_spectra[:,ss]
+			obsSignal = np.nanmedian(obsSpec[SN_cont_Lrange])
 
-	# 	galaxy_cube[:,inbin] = galaxy_spectra[bb]
-	# 	continuum_cube[:,inbin] = bestfit_continuum[bb]
-	# 	contsub_cube[:,inbin] =  contsub_spectra[bb]
+			fitSpec_scaled = fitSpec * obsSignal / fitSignal			#Scale fit by ratio of emission/signal in binned and individual spectra
 
+			contsub_spectra[:,ss] = obsSpec - fitSpec_scaled
+	print("...Done")
+	sys.stdout.flush()
 
-	galaxy_cube = galaxy_cube.reshape(Nl,Ny,Nx)
-	noise_cube = noise_cube.reshape(Nl,Ny,Nx)
-	continuum_cube = continuum_cube.reshape(Nl,Ny,Nx)
+	#Reshape into a datacube
+	contsub_cube[:,np.asarray(spax_properties['spax_num'].data,dtype=int)] = contsub_spectra
 	contsub_cube = contsub_cube.reshape(Nl,Ny,Nx)
 	
 
+	#Save continuum-subtracted spectra and datacube
 	header = fits.Header()
 	header['COMMENT'] = "A.B. Watts"
 	header['COMMENT'] = "LOG LAMBDA IS IN THIS HDU "
 	primary_hdu = fits.PrimaryHDU(data = logLambda_obs,
 									header = header)
-
 	spectra_hdu = fits.BinTableHDU.from_columns(
 							fits.ColDefs([
 							fits.Column(
 							array = contsub_spectra.T,
 							name='CONTSUB',format=str(len(contsub_spectra))+'D'
 							)]))
-
 	noise_hdu = fits.BinTableHDU.from_columns(
 							fits.ColDefs([
 							fits.Column(
@@ -3828,383 +2073,77 @@ def make_continuum_subtracted_spectra(parameterfile):
 	print("Saved")
 
 
-	# print("Saving datacubes")
-
-	# continuum_cube = np.zeros([Nl,Nx*Ny])
-	# continuum_cube[:,np.array(spax_properties['spax_num'][:],dtype=int)] = bestfit_continuum
-	# continuum_cube = continuum_cube.reshape(Nl,Ny,Nx)
-
-	# contsub_cube = np.zeros([Nl,Nx*Ny])
-	# contsub_cube[:,np.array(spax_properties['spax_num'][:],dtype=int)] = contsub_spectra
-	# contsub_cube = contsub_cube.reshape(Nl,Ny,Nx)
-
-
-	# cube_file = "/Users/00088350/Research/projects/NGC4383/MUSE/spectral_fitting/outputs/testcube/testcube.fits"
 	cube_file = parameters['datacube']
 	cube_hdu = fits.open(cube_file)
 	cube_header = cube_hdu[1].header
 	cube_hdu.close()
-	# cube_header['NAXIS3'] = len(logLambda_obs)
-	cube_header['CRVAL3'] = logLambda_obs[0]
+	cube_header['CRVAL3'] = 1
 	cube_header['CRPIX3'] = 1
 	print(cube_header.keys())
 	if any(key == "CDELT3" for key in cube_header.keys()):
-		cube_header['CDELT3'] = np.abs(np.diff(logLambda_obs))[0]
+		cube_header['CDELT3'] = 1
 	else:
-		cube_header['CD3_3'] = np.abs(np.diff(logLambda_obs))[0]
+		cube_header['CD3_3'] = 1
 
-	cube_header['CTYPE3'] = "AWAV-LOG"
-
-
-	# primary_hdu = fits.PrimaryHDU(header = fits.Header())
-	# galaxy_cube_hdu = fits.ImageHDU(galaxy_cube,
-	# 						name='galaxy',
-	# 						header = cube_header)
-	# hdul = fits.HDUList([primary_hdu,
-	# 							galaxy_cube_hdu])
-	# print("Saving log-rebinned galaxy cube")
-	# hdul.writeto(f"{parameters['output_dir']}/logRebingalaxy_cube.fits",overwrite=True)
-	# print("Saved")
+	cube_header['CTYPE3'] = "Chan"
+	header = fits.Header()
+	header['COMMENT'] = "A.B. Watts"
+	header['COMMENT'] = "LOG LAMBDA IS IN THIS HDU "
+	primary_hdu = fits.PrimaryHDU(header = header,data = logLambda_obs)
 
 
-
-	# primary_hdu = fits.PrimaryHDU(header = fits.Header())
-	# continuum_cube_hdu = fits.ImageHDU(continuum_cube,
-	# 						name='CONTINUUM',
-	# 						header = cube_header)
-	# hdul = fits.HDUList([primary_hdu,
-	# 							continuum_cube_hdu])
-	# print("Saving bestfit continuum cube")
-	# hdul.writeto(f"{parameters['output_dir']}/bestfit_continuum_cube.fits",overwrite=True)
-	# print("Saved")
-
-
-	primary_hdu = fits.PrimaryHDU(header = fits.Header())
 	contsub_cube_hdu = fits.ImageHDU(contsub_cube,
 							name='CONTSUB',
 							header = cube_header)
-	noise_cube_hdu = fits.ImageHDU(noise_cube,
-							name='NOISE',
-							header = cube_header)
 	hdul = fits.HDUList([primary_hdu,
-								contsub_cube_hdu,noise_cube_hdu])
+								contsub_cube_hdu])#,noise_cube_hdu])
 	print("Saving continuum-subtracted cube")
 	hdul.writeto(f"{parameters['output_dir']}/contsub_cube.fits",overwrite=True)
 	print("Saved")
 
-
-	##this is just the bestfit continuum cube again?
-	# linefree_spectra = galaxy_spectra - contsub_spectra
-	# linefree_cube = np.zeros([Nl,Nx*Ny])
-	# linefree_cube[:,np.array(spax_properties['spax_num'][:],dtype=int)] = linefree_spectra
-	# linefree_cube = linefree_cube.reshape(Nl,Ny,Nx)
-
-	# primary_hdu = fits.PrimaryHDU(header = fits.Header())
-	# linefree_cube_hdu = fits.ImageHDU(linefree_cube,
-	# 						name='LINEFREE',
-	# 						header = cube_header)
-	# hdul = fits.HDUList([primary_hdu,
-	# 							linefree_cube_hdu])
-	# print("Saving linefree cube")
-	# hdul.writeto(f"{parameters['output_dir']}/linefree_cube.fits",overwrite=True)
-	# print("Saved")
-	
-def check_continuum_at_emissionlines(parameters):
-	
-	spax_properties = Table.read(f"{parameters['output_dir']}/spaxel_properties.fits")
-	bright_spectra = np.argsort(spax_properties['spax_signal_cont']/spax_properties['spax_noise_cont'])[::-1][0:5]
-
-	spectra_file = f"{parameters['output_dir']}/logRebin_spectra.fits"
-	hdul = fits.open(spectra_file)
-	logLambda, spectra = read_spectra_hdul(hdul)
-	linLambda = np.exp(logLambda)
-	hdul.close()
-	spectra = spectra[0]
-	spectra = spectra[:,bright_spectra]
-
-	continuum_spectra_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
-	hdul = fits.open(continuum_spectra_file)
-	logLambda, continuum_spectra = read_spectra_hdul(hdul)
-	hdul.close()
-	gasline_spectra = continuum_spectra[1]
-	continuum_spectra = continuum_spectra[0]
-	continuum_spectra = continuum_spectra[:,bright_spectra]
-	gasline_spectra = gasline_spectra[:,bright_spectra]
-
-	width = 3500/3.e5
-
-	emlines = {'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
-			'OIII':{	'lambda':[4958.911, 5006.843],	'ratio':[0.35,1]}, 
-			'HeI5876':{	'lambda':[5875.624],			'ratio':[1]}, 
-			'OI':{		'lambda':[6300.304,6363.78],	'ratio':[1,0.33]},
-			'Halpha+NII':{	'lambda':[6562.819,6548.050,6583.460],			'ratio':[1]},
-			# 'HeI6678':{	'lambda':[6678.151],			'ratio':[1]}, 
-			'SII6716':{	'lambda':[6716.440,6730.810],			'ratio':[1]}
-			# 'ArIII7135':{'lambda':[7135.790],			'ratio':[1]}, 
-			# 'OII':{		'lambda':[7319.990, 7330.730],	'ratio':[1,1]}, #?? check
-			# 'ArIII7751':{'lambda':[7751.060],			'ratio':[1]},
-			# 'SIII':{	'lambda':[9068.6],				'ratio':[1]}
-			}
-
-	lines = []
-	for nn,line in enumerate(emlines):
-		if np.max(emlines[line]['lambda']) < np.max(linLambda) and np.min(emlines[line]['lambda'])>np.min(linLambda):
-			lines.extend([line])
-
-
-	fig1 = plt.figure(figsize=(4*len(spectra[0,:]),3*len(lines)))
-	gs1 = gridspec.GridSpec(len(lines),len(spectra[0,:]))
-
-	fig2 = 	plt.figure(figsize=(4*len(spectra[0,:]),3*len(lines)))
-	gs2 = gridspec.GridSpec(len(lines),len(spectra[0,:]),)
-
-
-	for ll, line in enumerate(lines):
-
-		specrange = np.logical_and(logLambda < np.log(np.max(emlines[line]['lambda'])*(1 + width)),
-									logLambda > np.log(np.min(emlines[line]['lambda'])*(1-width)))
-
-
-		for ss in range(len(spectra[0,:])):
-			ax1 = fig1.add_subplot(gs1[ll,ss])
-
-
-			ax1.plot(linLambda[specrange],spectra[specrange,ss])
-			ax1.plot(linLambda[specrange],continuum_spectra[specrange,ss])
-			# ax1.set_ylim([0.85*np.median(continuum_spectra[specrange,ss]),
-									# 1.1*np.median(continuum_spectra[specrange,ss])])
-			ax1.set_ylim([(np.min(continuum_spectra[specrange,ss])),
-									np.median(continuum_spectra[specrange,ss]) + 0.1*np.max(spectra[specrange,ss])])
-			ax1.set_aspect(0.5*np.abs(np.diff(ax1.get_xlim()))/np.abs(np.diff(ax1.get_ylim())))
-			if ss == 0:
-				ax1.text(0.01,0.1,line,transform=ax1.transAxes)
-				ax1.set_ylabel("Flux")
-			ax1.tick_params(which='both',axis='both',direction='in')
-			if ll == len(lines)-1:
-				ax1.set_xlabel("Wavelength")
-			if ll == 0:
-				ax1.text(0.7,0.2,"Galaxy",transform=ax1.transAxes,color='Blue')
-				ax1.text(0.7,0.1,"Cont. fit",transform=ax1.transAxes,color='Orange')
-
-
-			ax2 = fig2.add_subplot(gs1[ll,ss])
-			ax2.plot(linLambda[specrange],spectra[specrange,ss])
-			ax2.plot(linLambda[specrange],continuum_spectra[specrange,ss]+gasline_spectra[specrange,ss])
-			ax2.set_ylim([0.85*np.median(continuum_spectra[specrange,ss]),
-									1.1*np.median(continuum_spectra[specrange,ss]+gasline_spectra[specrange,ss])])
-			ax2.set_aspect(0.5*np.abs(np.diff(ax2.get_xlim()))/np.abs(np.diff(ax2.get_ylim())))
-			if ss == 0:
-				ax2.text(0.01,0.1,line,transform=ax2.transAxes)
-				ax2.set_ylabel("Flux")
-			ax2.tick_params(which='both',axis='both',direction='in')
-			if ll == len(lines)-1:
-				ax2.set_xlabel("Wavelength")
-			if ll == 0:
-				ax2.text(0.7,0.2,"Galaxy",transform=ax2.transAxes,color='Blue')
-				ax2.text(0.7,0.1,"Cont. fit",transform=ax2.transAxes,color='Orange')
-
-
-	fig1.tight_layout()
-	fig2.tight_layout()
-
-	# plt.show()
-	fig1.savefig(f"{parameters['output_dir']}/figures/absline_check.pdf")
-	fig2.savefig(f"{parameters['output_dir']}/figures/emline_check.pdf")
-
-def check_contsub_emlines(parameters):
-	spax_properties = Table.read(f"{parameters['output_dir']}/spaxel_properties.fits")
-	bright_spectra = np.argsort(spax_properties['spax_signal_cont']/spax_properties['spax_noise_cont'])[::-1][0:5]
-
-	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
-	hdul = fits.open(spectra_file)
-	logLambda, spectra = read_spectra_hdul(hdul)
-	linLambda = np.exp(logLambda)
-	hdul.close()
-	spectra = spectra[0]
-	spectra = spectra[:,bright_spectra]
-
-	# continuum_spectra_file = f"{parameters['output_dir']}/bestfit_continuum_spectra.fits"
-	# hdul = fits.open(continuum_spectra_file)
-	# logLambda, continuum_spectra = read_spectra_hdul(hdul)
-	# hdul.close()
-	# gasline_spectra = continuum_spectra[1]
-	# continuum_spectra = continuum_spectra[0]
-	# continuum_spectra = continuum_spectra[:,bright_spectra]
-	# gasline_spectra = gasline_spectra[:,bright_spectra]
-
-	width = 800/3.e5
-
-	emlines = {'Hbeta':{	'lambda':[4861.333],			'ratio':[1]},
-			'OIII5007':{	'lambda':[5006.843],	'ratio':[0.35,1]}, 
-			# 'HeI5876':{	'lambda':[5875.624],			'ratio':[1]}, 
-			# 'OI':{		'lambda':[6300.304,6363.78],	'ratio':[1,0.33]},
-			'Halpha':{	'lambda':[6562.819],			'ratio':[1]},
-			# 'HeI6678':{	'lambda':[6678.151],			'ratio':[1]}, 
-			'SII6716':{	'lambda':[6716.440,6730.810],			'ratio':[1]}
-			# 'ArIII7135':{'lambda':[7135.790],			'ratio':[1]}, 
-			# 'OII':{		'lambda':[7319.990, 7330.730],	'ratio':[1,1]}, #?? check
-			# 'ArIII7751':{'lambda':[7751.060],			'ratio':[1]},
-			# 'SIII':{	'lambda':[9068.6],				'ratio':[1]}
-			}
-
-	lines = []
-	for nn,line in enumerate(emlines):
-		if np.max(emlines[line]['lambda']) < np.max(linLambda) and np.min(emlines[line]['lambda'])>np.min(linLambda):
-			lines.extend([line])
-
-
-	fig1 = plt.figure(figsize=(4*len(spectra[0,:]),3*len(lines)))
-	gs1 = gridspec.GridSpec(len(lines),len(spectra[0,:]))
-
-	# fig2 = plt.figure(figsize=(3*len(spectra[0,:]),4*len(lines)))
-	# gs2 = gridspec.GridSpec(len(lines),len(spectra[0,:]),hspace=0.08,wspace=0.3,
-	# 		left=0.05,right=0.99,top=0.99,bottom=0.08)
-
-
-	for ll, line in enumerate(lines):
-
-		specrange = np.logical_and(logLambda < np.log(np.max(emlines[line]['lambda'])*(1 + width)),
-									logLambda > np.log(np.min(emlines[line]['lambda'])*(1-width)))
-
-
-		for ss in range(len(spectra[0,:])):
-			ax1 = fig1.add_subplot(gs1[ll,ss])
-
-
-			ax1.plot(linLambda[specrange],spectra[specrange,ss])
-			# ax1.plot(linLambda[specrange],continuum_spectra[specrange,ss])
-			# ax1.set_ylim([-10*np.abs(np.median(spectra[specrange,ss])),
-									# 1.1*np.max(spectra[specrange,ss])])
-			ax1.set_ylim([-0.2*np.max(spectra[specrange,ss]),
-									0.75*np.max(spectra[specrange,ss])])
-			ax1.set_aspect(0.5*np.abs(np.diff(ax1.get_xlim()))/np.abs(np.diff(ax1.get_ylim())))
-			if ss == 0:
-				ax1.text(0.01,0.1,line,transform=ax1.transAxes)
-				ax1.set_ylabel("Flux")
-			ax1.tick_params(which='both',axis='both',direction='in')
-			if ll == len(lines)-1:
-				ax1.set_xlabel("Wavelength")
-			if ll == 0:
-				# ax1.text(0.7,0.2,"Galaxy",transform=ax1.transAxes,color='Blue')
-				ax1.text(0.7,0.1,"Cont. sub.",transform=ax1.transAxes,color='Blue')
-
-
-			# ax2 = fig2.add_subplot(gs1[ll,ss])
-			# ax2.plot(linLambda[specrange],spectra[specrange,ss])
-			# ax2.plot(linLambda[specrange],continuum_spectra[specrange,ss]+gasline_spectra[specrange,ss])
-			# ax2.set_ylim([0.85*np.median(continuum_spectra[specrange,ss]),
-			# 						1.1*np.median(continuum_spectra[specrange,ss]+gasline_spectra[specrange,ss])])
-			# ax2.set_aspect(0.5*np.abs(np.diff(ax2.get_xlim()))/np.abs(np.diff(ax2.get_ylim())))
-			# if ss == 0:
-			# 	ax2.text(0.01,0.1,line,transform=ax2.transAxes)
-			# 	ax2.set_ylabel("Flux")
-			# ax2.tick_params(which='both',axis='both',direction='in')
-			# if ll == len(lines)-1:
-			# 	ax2.set_xlabel("Wavelength")
-			# if ll == 0:
-			# 	ax2.text(0.7,0.2,"Galaxy",transform=ax2.transAxes,color='Blue')
-			# 	ax2.text(0.7,0.1,"Cont. fit",transform=ax2.transAxes,color='Orange')
-
-
-	fig1.tight_layout()
-
-	# plt.show()
-	fig1.savefig(f"{parameters['output_dir']}/figures/contsub_spectra_check.pdf")
-	# fig2.savefig(f"{parameters['output_dir']}/figures/emline_check.pdf")
-
-def find_signal_free_spaxels(parameters):
-	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
-	hdul = fits.open(spectra_file)
-	logLambda, spectra = read_spectra_hdul(hdul)
-	linLambda = np.exp(logLambda)
-	hdul.close()
-	spectra = spectra[0]
-
-
-	HA_lambda = 6562.819
-	width1 = 400/c
-
-	specrange1 = np.logical_and(logLambda < np.log(HA_lambda)*(1 + width1),
-									logLambda > np.log(HA_lambda)*(1-width1))
-
-	width = 300/c
-
-	specrange = np.logical_and(logLambda < np.log(HA_lambda)*(1 + width),
-									logLambda > np.log(HA_lambda)*(1-width))
-
-	HA_signal = np.zeros([len(spectra[0,:])])
-
-	for ss in range(len(spectra[0,:])):
-		# HA_sigma = np.std(spectra[specrange,ss])
-		# HA_signal[ss] = np.max(spectra[specrange,ss])
-		# HA_signal[ss] = np.max(np.abs(spectra[specrange,ss])) / HA_sigma
-		# HA_signal[ss] = np.sum(spectra[specrange,ss][spectra[specrange,ss]>0])
-		HA_signal[ss] = np.sum(spectra[specrange,ss])
-		# HA_signal[ss] = np.median(spectra[specrange,ss])
-
-
-
-
-	HA_argsort =  np.argsort(np.abs(HA_signal))
-	# HA_signal = HA_signal[HA_argsort]
-	# plt.scatter(range(len(HA_signal)),HA_signal)
-	# plt.show()
-	# exit()
-
-	# lowsig = np.where(np.abs(HA_signal)<1.5)[0]
-	lowsig = HA_argsort[0:200]
-	print(len(lowsig))
-	
-	sigmas = np.zeros([len(spectra)])
-
-	for ii in range(len(spectra)):
-		signal_free = spectra[ii,lowsig]
-		# signal_free =  np.append(signal_free[signal_free<np.median(signal_free)],-1*signal_free[signal_free<np.median(signal_free)])
-
-		med = np.median(signal_free)
-		MAD = astrofunc.median_absolute_deviation(
-					signal_free[signal_free<np.percentile(signal_free,68)])
-		signal_free =  signal_free[signal_free< med + 4*MAD]
-		med = np.median(signal_free)
-		MAD = astrofunc.median_absolute_deviation(signal_free)
-		sigmas[ii] = MAD
-		# print(ii,np.exp(logLambda[ii]))
-		# print(med)
-		# print(MAD,np.std(signal_free))
-		# plt.hist(signal_free,bins=20)
-		# plt.show()
-	plt.plot(linLambda,sigmas)
-	plt.show()
-
-	np.savetxt(f"{parameters['output_dir']}/wavelength_sigma.txt",np.vstack([logLambda,sigmas]).T)
-
-
-	# for ii in range(len(lowsig))[::-1]:
-	# 	print(HA_signal[lowsig[ii]])
-	# 	print(np.std(spectra[specrange1,lowsig[ii]]))
-	# 	plt.plot(np.arange(len(logLambda))[specrange1],spectra[specrange1,lowsig[ii]])
-	# 	plt.ylim([-20,20])
-	# 	plt.fill_between(np.arange(len(logLambda))[specrange],y1=20,y2=-20,color='Grey',alpha=0.5)
-	# 	plt.show()
-	# exit()
-	
-	
 def make_line_subcubes(parameterfile):
+	"""
+	Extracts sub-cubes around emission lines from a continuum-subtracted cube
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes spectra to file
+	"""
+
+	#Lines to extract
+	lines = {'Hbeta':{	'lambda':[4861.333]	},
+		'OIII4959':{	'lambda':[4958.911]	}, 
+		'OIII5006':{	'lambda':[5006.843]	}, 
+		'HeI5876':{	'lambda':[5875.624]		}, 
+		'OI6300':{		'lambda':[6300.304]	},
+	 	'NII6548':{		'lambda':[6548.050]	},
+	 	'NII6583':{		'lambda':[6583.460]	},
+		'Halpha':{	'lambda':[6562.819]		},
+		'HeI6678':{	'lambda':[6678.151]		}, 
+		'SII6716':{	'lambda':[6716.440]		},
+		'SII6730':{	'lambda':[6730.810]		}
+		}
+
+
+	print("Making emission-line subcubes")
+	sys.stdout.flush()
+
+	#Read parameters and pixel properties
 	parameters = read_parameterfile(parameterfile)
-
-
 	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 	Nx = spax_properties.meta['NX']
 	Ny = spax_properties.meta['NY']
 
-	# sigmas =  np.loadtxt(f"{parameters['output_dir']}/wavelength_sigma.txt")
-	# sigmaLambda =  sigmas[:,1]
-
+	#Get continuum-subtracted spectra
 	spectra_file = f"{parameters['output_dir']}/logRebin_contsub_spectra.fits"
-
 	hdul = fits.open(spectra_file)
 	logLambda, spectra = read_spectra_hdul(hdul)
-	# logLambda = np.exp(logLambda)
 	linLambda = np.exp(logLambda)
 	hdul.close()
 	contsub_spectra = spectra[0]
@@ -4212,183 +2151,125 @@ def make_line_subcubes(parameterfile):
 	spectra = None
 	Nl = contsub_spectra.shape[1]
 
-
-	spectrum_mask = np.zeros_like(contsub_spectra,dtype=bool)
-	# print(spectrum_mask)
-	# print(sigmaLambda)
-
-	line_shifts = np.zeros([contsub_spectra.shape[1]])
-
-	for ii in range(contsub_spectra.shape[1]):
-		spectrum_mask[:,ii] = np.greater(np.abs(contsub_spectra[:,ii]), 3*noise[:,ii])
-		spectrum = copy.deepcopy(contsub_spectra[:,ii])
-		# plt.plot(linLambda,spectrum)
-		# plt.plot(linLambda,noise[:,ii]*3)
-		# plt.show()
-		spectrum[spectrum_mask[:,ii]==False] = 0
-
-		HA_window = np.logical_and(logLambda < np.log(6562.816*(1 + (300./c))),
-			logLambda > np.log(6562.816*(1 - (300./c))))
-		# print(spectrum[HA_window])
-
-		if np.all(spectrum[HA_window] <= 0):
-			line_shifts[ii] = np.nan
-		else:
-			HAloc = np.where(spectrum[HA_window] == np.max(spectrum[HA_window]))[0]
-			# print(spectrum[HA_window][HAloc])
-			HAloc_logLambda = logLambda[HA_window][HAloc]
-			line_shift = HAloc_logLambda - np.log(6562.816)
-			line_shifts[ii] = line_shift
-
-
-	# print(line_shifts)
-	# exit()
-
-
+	#Get header template
 	cube_file = parameters['datacube']
 	cube_hdu = fits.open(cube_file)
 	cube_header = cube_hdu[1].header
 	cube_hdu.close()
 
-
-	lines = {'Hbeta':{	'lambda':[4861.333]			},
-			'OIII4959':{	'lambda':[4958.911]	}, 
-			'OIII5006':{	'lambda':[5006.843]	}, 
-			# 'HeI5876':{	'lambda':[5875.624]			}, 
-			# 'OI6300':{		'lambda':[6300.304]	},
-			# 'OI6363':{		'lambda':[6363.78]	},
-		 	'NII6548':{		'lambda':[6548.050]	},
-		 	'NII6583':{		'lambda':[6583.460]	},
-			'Halpha':{	'lambda':[6562.819]			},
-			'HeI6678':{	'lambda':[6678.151]			}, 
-			'SII6716':{	'lambda':[6716.440]			},
-			'SII6730':{	'lambda':[6730.810]			},
-			# 'ArIII7135':{'lambda':[7135.790]			}, 
-			# 'OII':{		'lambda':[7319.990]	}
-			# 'OII':{		'lambda':[7330.730]	}
-			# 'ArIII7751':{'lambda':[7751.060]			},
-			# 'SIII':{	'lambda':[9068.6]				}
-			}
-
-			
-	# lines = {'OI6300':{		'lambda':[6300.304]	}}
-
+	#Set up directory
 	if not os.path.isdir(f"{parameters['output_dir']}/linecubes"):
 		os.mkdir(f"{parameters['output_dir']}/linecubes")
 
-	subcube_width = 1000 / c
-	for ll, line in enumerate(lines):
+	#Subcube parameters
+	clipping_width = 1500 / c
+	subcube_width = 500 / c
+	for ll, line in enumerate(lines):		#Loop over emission lines
 
+		#Get line range for subcube
 		lineLambda = lines[line]['lambda'][0]
-
 		subcube_range =  np.where((logLambda > np.log(lineLambda*(1 - subcube_width)))  & 
 								(logLambda < np.log(lineLambda*(1 + subcube_width))))[0]
-
+		clipping_range = np.where((logLambda > np.log(lineLambda*(1 - clipping_width)))  & 
+								(logLambda < np.log(lineLambda*(1 + clipping_width))))[0]
 		logLambda_subcube = logLambda[subcube_range]
-
-		subcube_spectra = contsub_spectra[subcube_range,:]
+		subcube_spectra = np.full(contsub_spectra[subcube_range,:].shape,np.nan)
 		subcube_noise = noise[subcube_range,:]
-		# sigmaLambda_spectra = np.full(subcube_spectra.T.shape,subcube_noise).T
-		# print(sigmaLambda_spectra)
-		# exit()
 
 
-		for ii in range(subcube_spectra.shape[1]):
-			line_shift = line_shifts[ii]
-		
-			if np.isfinite(line_shift):
+		for ii in range(contsub_spectra.shape[1]):	#Loop over spectra
 
-				if line == "Halpha":	
-					line_min_logLambda = np.log(0.5*(lineLambda + 6548.050)) + line_shift
-					line_max_logLambda = np.log(0.5*(lineLambda + 6583.460)) + line_shift
-					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
-									logLambda_subcube  < line_max_logLambda)
-					subcube_spectra[~logLambda_window,ii] = 0
-					# subcube_noise[~logLambda_window,ii] = 0
-				elif line == "NII6548":	
-					line_min_logLambda = np.min(logLambda_subcube)
-					line_max_logLambda = np.log(0.5*(lineLambda + 6562.819)) + line_shift
-					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
-									logLambda_subcube  < line_max_logLambda)
-					subcube_spectra[~logLambda_window,ii] = 0
-					# subcube_noise[~logLambda_window,ii] = 0
-				elif line == "NII6583":	
-					line_min_logLambda = np.log(0.5*(lineLambda + 6562.819)) + line_shift
-					line_max_logLambda = np.max(logLambda_subcube)
-					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
-									logLambda_subcube  < line_max_logLambda)
-					subcube_spectra[~logLambda_window,ii] = 0
-					# subcube_noise[~logLambda_window,ii] = 0
+			#Sigma-clip spectrum and fit and subtract a polynomial to remove any residual continuum
+			logLambda_clipRange = logLambda[clipping_range]
+			unclippedSpectrum = contsub_spectra[clipping_range,ii]
+			clippedSpectrum = sigma_clip(unclippedSpectrum,2.,2.)
+			fit,covar = curve_fit(baselineFunc,
+								logLambda_clipRange[~clippedSpectrum.mask],
+								clippedSpectrum[~clippedSpectrum.mask])
+			spectrum = contsub_spectra[subcube_range,ii]
+			spec_noise = noise[subcube_range,ii]
+			spectrum = spectrum - baselineFunc(logLambda_subcube,fit[0],fit[1],fit[2])
 
-				elif line == "SII6716":	
-					line_min_logLambda = np.min(logLambda_subcube)
-					line_max_logLambda = np.log(0.5*(lineLambda + 6730.810)) + line_shift
-					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
-									logLambda_subcube  < line_max_logLambda)
-					subcube_spectra[~logLambda_window,ii] = 0
-					# subcube_noise[~logLambda_window,ii] = 0
-				elif line == "SII6730":	
-					line_min_logLambda = np.log(0.5*(lineLambda + 6716.440)) + line_shift
-					line_max_logLambda = np.max(logLambda_subcube)
-					logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
-									logLambda_subcube  < line_max_logLambda)
-					subcube_spectra[~logLambda_window,ii] = 0
-					# subcube_noise[~logLambda_window,ii] = 0
-				
-				
-				subcube_spectra_SN = subcube_spectra[:,ii] / subcube_noise[:,ii]
-				mask1 = np.zeros_like(subcube_spectra_SN)
-				mask2 = np.zeros_like(subcube_spectra_SN)
+			#Account for neaby lines
+			if line == "OIII5006":	
+				line_min_logLambda = np.min(logLambda_subcube)
+				line_max_logLambda = np.log(0.5*(lineLambda + emlines_indiv['Fe5018']['lambda'][0])) 
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+			elif line == "Halpha":	
+				line_min_logLambda = np.log(0.5*(lineLambda + 6548.050))
+				line_max_logLambda = np.log(0.5*(lineLambda + 6583.460)) 
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+			elif line == "NII6548":	
+				line_min_logLambda = np.min(logLambda_subcube)
+				line_max_logLambda = np.log(0.5*(lineLambda + 6562.819))
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+			elif line == "NII6583":	
+				line_min_logLambda = np.log(0.5*(lineLambda + 6562.819)) 
+				line_max_logLambda = np.max(np.log(np.exp(logLambda_subcube)))
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+
+			elif line == "SII6716":	
+				line_min_logLambda = np.min(logLambda_subcube)
+				line_max_logLambda = np.log(0.5*(lineLambda + 6730.810)) 
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+			elif line == "SII6730":	
+				line_min_logLambda = np.log(0.5*(lineLambda + 6716.440)) 
+				line_max_logLambda = np.max(logLambda_subcube)
+				logLambda_window = np.logical_and(logLambda_subcube > line_min_logLambda,
+								logLambda_subcube  < line_max_logLambda)
+				spectrum[~logLambda_window] = 0
+
+			
+			subcube_spectra_SN =  spectrum/ spec_noise			#make an S/N spectrum
+			mask1 = np.zeros_like(subcube_spectra_SN)
+			mask2 = np.zeros_like(subcube_spectra_SN)
 
 
-				for cc,chan in enumerate(subcube_spectra_SN[1:-1]):
-					if chan >= 3.5:
-						if subcube_spectra_SN[cc] >=3.5 or subcube_spectra_SN[cc+2] >=3.5:
-							mask1[cc+1] = 1
+			for cc in range(1,len(subcube_spectra_SN)-1):		
+				if subcube_spectra_SN[cc] >=3.5:				#Narrow mask, all channels >3 sigma (line detection)
+					mask1[cc] = 2
+				if subcube_spectra_SN[cc] >= 1.5:				#Broad mask, those with >1.5 sigma in >2 contiguous channels
+					if subcube_spectra_SN[cc-1] >=1.5 and subcube_spectra_SN[cc+1] >=1.5 :
+						mask2[cc] = 1
+						mask2[cc-1] = 1
+						mask2[cc+1] = 1
 
-					if chan >= 2:
-						if subcube_spectra_SN[cc] >=2 or subcube_spectra_SN[cc+2] >=2:
-							mask2[cc+1] = 1
+			mask_tot = mask1+mask2
+			mask_segments = []
+			seg = []
 
-				
-				mask_tot = mask1+mask2
-				mask_segments = []
-				seg = []
+			for mm, val in enumerate(mask_tot):					#Keep only broad mask segments that also have a narrow mask
+				if val == 0 or mm == len(mask_tot)-1:
+					if len(seg) != 0:
+						mask_segments.append(seg)
+						seg = []
 
-				for mm, val in enumerate(mask_tot):
-					if val == 0:
-						if len(seg) != 0:
-							mask_segments.append(seg)
-							seg = []
+				if val != 0:
+					seg.extend([mm])
+			maxlen = 0
+			mask_final = np.zeros_like(mask_tot)
 
-					if val != 0:
-						seg.extend([mm])
-
-				mask_final = np.zeros_like(mask_tot)
-				
-				for seg in mask_segments:
-					# print(seg)
-					# print(mask_tot[seg])
-					if np.any(mask_tot[seg] == 2):
-						# seg.extend([seg[0]-1,seg[-1]+1])
+			for seg in mask_segments:							#Keep only the largest mask segment
+				if np.any(mask_tot[seg] >= 2):
+					if len(seg)> maxlen:
+						mask_final = np.zeros_like(mask_tot)
+						maxlen = len(seg)
 						mask_final[seg] = 1
 
-				subcube_spectra[:,ii] *= mask_final
-				# subcube_noise[:,ii] *= mask_final
-
-				# subcube_spectra[:,ii][subcube_spectra[:,ii] < 3.*subcube_noise] = 0
-				# plt.plot(np.exp(logLambda_subcube),subcube_spectra[:,ii])
-				# plt.plot(np.exp(logLambda_subcube),mask1*np.max(subcube_spectra[:,ii]))
-				# plt.plot(np.exp(logLambda_subcube),mask2*np.max(subcube_spectra[:,ii]),ls=':')
-				# plt.plot(np.exp(logLambda_subcube),mask_final*np.max(subcube_spectra[:,ii]),ls='--')
-				# plt.show()
-				# exit()
-			else:
-				subcube_spectra[:,ii] = 0
-				# subcube_noise[:,ii] = 0
+			subcube_spectra[:,ii] = spectrum*mask_final			#Mask emission line
 
 
-
+		#Save subcube spectra
 		spectra_header = fits.Header()
 		spectra_header['COMMENT'] = "A.B. Watts"
 		spectra_header['COMMENT'] = "LOG LAMBDA IS IN THIS HDU "
@@ -4415,29 +2296,34 @@ def make_line_subcubes(parameterfile):
 		print("Saved")
 		
 
+		#Save as a cube for visualisation
 		cube_header['NAXIS3'] = len(logLambda_subcube)
-		cube_header['CRVAL3'] = logLambda_subcube[0]
+		cube_header['CRVAL3'] = 1
 		cube_header['CRPIX3'] = 1
 		if any(key == "CDELT3" for key in cube_header.keys()):
-			cube_header['CDELT3'] = np.abs(np.diff(logLambda_subcube))[0]
+			cube_header['CDELT3'] = 1
 		else:
-			cube_header['CD3_3'] = np.abs(np.diff(logLambda_subcube))[0]
+			cube_header['CD3_3'] = 1
 
 		Nl = subcube_spectra.shape[0]
 
 		subcube_cube = np.zeros([Nl,Nx*Ny])
-		
-		for vv in range(subcube_spectra.shape[1]):
-			inbin = np.where(spax_properties['vorbin_num']==vv)[0]
-			spax_num_inbin = np.array(spax_properties['spax_num'][inbin],dtype=int)
-			subcube_cube[:,spax_num_inbin] = np.full((len(inbin),Nl),subcube_spectra[:,vv]).T
+		if parameters['contsub_level'] == 'spax':
+			subcube_cube[:,np.array(spax_properties['spax_num'],dtype=int)] = subcube_spectra
+		elif parameters['contsub_level'] == 'bin':
+			for vv in range(subcube_spectra.shape[1]):
+				inbin = np.where(spax_properties['vorbin_num']==vv)[0]
+				spax_num_inbin = np.array(spax_properties['spax_num'].data[inbin],dtype=int)
+				subcube_cube[:,spax_num_inbin] = np.full((len(inbin),Nl),subcube_spectra[:,vv]).T
 
 		subcube_cube = subcube_cube.reshape(Nl,Ny,Nx)
 
 		# plt.imshow(np.nansum(subcube_cube,axis=0))
 		# plt.show()
-
-		primary_hdu = fits.PrimaryHDU(header = fits.Header())
+		header = fits.Header()
+		header['COMMENT'] = "A.B. Watts"
+		header['COMMENT'] = "LOG LAMBDA IS IN THIS HDU "
+		primary_hdu = fits.PrimaryHDU(header = header,data=logLambda_subcube)
 		line_cube_hdu = fits.ImageHDU(subcube_cube,
 								name=line,
 								header = cube_header)
@@ -4448,41 +2334,30 @@ def make_line_subcubes(parameterfile):
 		print("Saved")
 
 def measure_linecubes(parameterfile):
+	"""
+	Measures line fluxes and kinematic moments from sub-cubes
 
+	Parameters
+	----------
+	filename : dict
+		linecube name
+
+	Returns
+	-------
+	kin
+		Emission line kinematics
+	names
+		Measured column names 
+	"""
+	print("Measuring fluxes and kinematics for each emission-line subcube")
+	sys.stdout.flush()
+
+	#Get parametes and pixel properties
 	parameters = read_parameterfile(parameterfile)
-
 	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 
-	# sigmas =  np.loadtxt(f"{parameters['output_dir']}/wavelength_sigma.txt")
-	# sigmaLambda =  sigmas[:,1]
-
+	#Use all subcubes in working directory
 	subspectra = glob.glob(f"{parameters['output_dir']}/linecubes/*_subspectra.fits")
-
-	RV = 4
-	k_l = lambda ll: extinction_curve(ll,RV=RV,extcurve='Calzetti00')
-
-	Av_flag = False
-	if any(['Halpha' in file for file in subspectra]) & any(['Hbeta' in file for file in subspectra]):
-		AV_flag = True
-	
-		Halpha_filename = f"{parameters['output_dir']}/linecubes/Halpha_subspectra.fits"
-		Hbeta_filename = f"{parameters['output_dir']}/linecubes/Hbeta_subspectra.fits"
-
-		F_Ha, names_Ha = measure_linecube_fluxes(Halpha_filename)
-		F_Hb, names_Hb = measure_linecube_fluxes(Hbeta_filename)
-
-		flux_HA = F_Ha[0]
-		flux_HB = F_Hb[0]
-
-		EBV_l = EBV_Hlines(flux_HA,flux_HB,6562.819,4861.333,2.83,
-							k_l = k_l)
-
-		Av = RV*EBV_l
-
-	else:
-		Av_flag = False
-		Av = 0
-		EBV_l = 0
 		
 
 	F_names = []
@@ -4490,9 +2365,9 @@ def measure_linecubes(parameterfile):
 	Kin_names = []
 	Kin_measures = []
 
-	for subspectra_file in subspectra:
+	for subspectra_file in subspectra:			#loop over sub-cubes
 
-		fluxes, names = measure_linecube_fluxes(subspectra_file,EBV= EBV_l,k_l = k_l)
+		fluxes, names = measure_linecube_fluxes(subspectra_file)
 		F_names.extend(names)
 		F_measures.extend(fluxes)
 			
@@ -4501,216 +2376,251 @@ def measure_linecubes(parameterfile):
 		Kin_measures.extend(kin)
 
 
-
 	F_measures = np.array(F_measures).T
 	Kin_measures = np.array(Kin_measures).T
 
-	if Av_flag:
-		reddening = np.array([EBV_l,Av]).T
-	else:
-		reddening = np.full([2,len(F_measures)],np.array([EBV_l,Av])).T
-
-
-	F_measures = np.hstack((reddening,F_measures))
-	F_names = ['EBV_l',"A_V"] + F_names
-
-
+	#Set up arrays for if we are working on the pixel or bin level
 	F_measures_expanded = np.zeros([len(spax_properties),F_measures.shape[1]])
 	Kin_measures_expanded = np.zeros([len(spax_properties),Kin_measures.shape[1]])
-
 	for bb in range(F_measures.shape[0]):
-		# fluxes_row = np.array([fluxes[ii][bb] for ii in range(len(fluxes))])
-		inbin = np.where(spax_properties['vorbin_num'] == bb)[0]
-		# spax_num_inbin = spax_properties['spax_num'][inbin]
-		
-		F_measures_expanded[inbin,:] = F_measures[bb,:]
-		Kin_measures_expanded[inbin,:] = Kin_measures[bb,:]
+		if parameters['contsub_level'] == 'spax':			#assign on the pixel level
+			F_measures_expanded[bb,:] = F_measures[bb,:]
+			Kin_measures_expanded[bb,:] = Kin_measures[bb,:]
+		elif parameters['contsub_level'] == 'bin':			#assign on the bin level
+			inbin = np.in1d(spax_properties['vorbin_num'].data,bb)
+			F_measures_expanded[inbin,:] = F_measures[bb,:]
+			Kin_measures_expanded[inbin,:] = Kin_measures[bb,:]
 
 
+	#save outputs
 	fluxes_table = Table(F_measures_expanded,names=F_names)
 	kin_table = Table(Kin_measures_expanded,names=Kin_names)
-	# print(fluxes_table)
-	# exit()
-
-
 	fluxes_table.write(f"{parameters['output_dir']}/spax_emline_fluxes.fits",overwrite=True)
 	kin_table.write(f"{parameters['output_dir']}/spax_emline_kin.fits",overwrite=True)
-def measure_linecube_fluxes(filename,EBV = 0,k_l = None):
 
-	if isinstance(k_l,type(None)):
-		k_l = lambda ll: extinction_curve(ll,RV=4,extcurve='Calzetti00')
-		# A_l = lambda ll: EBV * k_l(ll)
+def measure_linecube_fluxes(filename):
+	"""
+	Measures line fluxes from sub-cubes
 
+	Parameters
+	----------
+	filename : dict
+		linecube name
+
+	Returns
+	-------
+	fluxes
+		Emission line fluxes and uncertainties for each spectrum
+	names
+		Measured column names names
+	"""
+
+	#Get data
 	hdul = fits.open(filename)
 	logLambda, spectra_list = read_spectra_hdul(hdul)
 	spectra = spectra_list[0]
 	noise = spectra_list[1]
 	hdul.close()
 
-	line = filename.split('/')[-1].split('_subspectra')[0]
-	names = [line,f"{line}_err",f"{line}_extcorr",f"{line}_err_extcorr"]
-
+	#Spectral resolution for integration
 	linLambda = np.exp(logLambda)
-	# print(linLambda)
-
-
-	# print(line)
-	# plt.plot(linLambda,k_l(linLambda))
-	# plt.show()
 	diff_lambda = np.append(np.diff(linLambda)[0]-np.diff(np.diff(linLambda))[0],
 							np.diff(linLambda))
 
-	# spectra_extcorr = spectra * np.power(10,0.4*EBV*k_l(linLambda))
 
+	#Get line name
+	line = filename.split('/')[-1].split('_subspectra')[0]
+	names = [line,f"{line}_err"]
+
+
+	#Set up arrays	
 	Fint = np.zeros([spectra.shape[1]])
 	Ferr = np.zeros([spectra.shape[1]])
-	Fint_extcorr = np.zeros([spectra.shape[1]])
-	Ferr_extcorr = np.zeros([spectra.shape[1]])
 
-	for ii in range(spectra.shape[1]):
+	for ii in range(spectra.shape[1]):			#Loop over spectra
 		spectrum = spectra[:,ii]
 		sigma = noise[:,ii]
-
 		spectrum_mask = spectrum > 0
 
-		if isinstance(EBV,int):
-			E_BV = EBV
-		else:
-			E_BV = EBV[ii]
-
-
-		Fint[ii] = np.nansum(spectrum*diff_lambda)
-		Ferr[ii] = np.nansum((sigma*spectrum_mask)*diff_lambda)
+		Fint[ii] = np.nansum(spectrum*diff_lambda)				#Integrate masked signal
+		Ferr[ii] = np.nansum((sigma*spectrum_mask)*diff_lambda)	#Integrate masked noise
 
 		if Fint[ii] == 0:				#set non-detection to 1 sigma assuming a 3 channel line
 			Fint[ii] = -99
-			# 3 closest channel to rest wavelength of line
-			loc = np.sort(np.argsort(np.abs(linLambda-emlines_indiv[line]['lambda'][0]))[0:6])+1
+			# 3 closest channels to rest wavelength of line
+			loc = np.sort(np.argsort(np.abs(linLambda-emlines_indiv[line]['lambda'][0]))[0:3])+1
 			Ferr[ii] = np.nansum(sigma[loc]*diff_lambda[loc])
-			# plt.plot(linLambda,spectrum)
-			# plt.plot(linLambda,sigma)
-			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(sigma[loc])),
-									# np.zeros_like(linLambda[loc]),
-									# color='Black',alpha=0.2)
-			# plt.show()
-			# exit()
-
-		# else:
-			# print(len(spectrum[spectrum>0]))
-			# loc = np.sort(np.argsort(np.abs(linLambda-emlines[line]['lambda'][0]))[0:6])+1
-			# plt.plot(linLambda,spectrum)
-
-			# plt.plot(linLambda,sigma)
-			# plt.fill_between(linLambda[loc],np.full_like(linLambda[loc],np.max(spectrum[loc])),
-									# np.zeros_like(linLambda[loc]),color='Black',alpha=0.2)
-
-			# plt.show()
-
-			# exit()
-
-
-		spectrum_extcorr = spectrum * np.power(10,0.4*E_BV*k_l(linLambda))
-		sigma_extcorr = sigma * np.power(10,0.4*E_BV*k_l(linLambda))
-
-		Fint_extcorr[ii] = np.nansum(spectrum_extcorr*diff_lambda)
-		Ferr_extcorr[ii] = np.nansum((sigma_extcorr*spectrum_mask)*diff_lambda)
 	
-	fluxes = [Fint,Ferr,Fint_extcorr,Ferr_extcorr]
+	fluxes = [Fint,Ferr]
 
 	return  fluxes, names
-
-
-
-
-
-	# contsub_spectra_file = f"{parameters['output']}/logRebin_contsub_spectra.fits"
-	# hdul = fits.open(contsub_spectra_file)
-	# logLambda, spectra = read_spectra_hdul(hdul)
-	# hdul.close()
-	# contsub_spectra = spectra[0]
-
-	# # wavelength = 6562.8
-	# wavelength = 4861.333
-
-	# xx = np.array([-200/3.e5,200/3.e5]) +  np.log(wavelength)
-	# logLrange = np.logical_and(logLambda >= xx[0], logLambda <= xx[1])
-	# specmax = np.nanmax(contsub_spectra[logLrange,0])
-	# maxloc = logLambda[logLrange][contsub_spectra[logLrange,0]==specmax]
-
-	# xx = np.array([-250/3.e5,250/3.e5]) +  maxloc
-	# logLrange = np.logical_and(logLambda >= xx[0], logLambda <= xx[1])
-	
-	# # plt.plot(logLambda,contsub_spectra[:,200],lw=0.5)
-	# # plt.plot([maxloc,maxloc],plt.gca().get_ylim(),lw=0.5)
-	# # plt.fill_between(xx, y1=plt.gca().get_ylim()[1])
-	# # plt.show()
-
-	# upper = np.logical_and(logLambda > maxloc, logLambda<xx[1])
-	# lower = np.logical_and(logLambda < maxloc, logLambda>xx[0])
-	# FWHM1 = np.interp(0.5*specmax,contsub_spectra[upper,0][::-1],logLambda[upper][::-1])
-	# FWHM2 = np.interp(0.5*specmax,contsub_spectra[lower,0],logLambda[lower])
-	# FWHM = FWHM1 - FWHM2
-	
-	# # xx = np.array([-1.25*FWHM,1.25*FWHM]) +  maxloc
-	# # logLrange = np.logical_and(logLambda >= xx[0], logLambda <= xx[1])
-
-	# print(specmax)
-	# # print(maxloc)
-
-	# plt.plot(logLambda,contsub_spectra[:,0],lw=0.5)
-	# plt.plot([maxloc,maxloc],plt.gca().get_ylim(),lw=0.5)
-	# plt.fill_between(xx, y1=plt.gca().get_ylim()[1],alpha=0.5,color='Black')
-	# plt.show()
 def measure_linecube_kinematics(filename):
+	"""
+	Measures line kinematic moments from sub-cubes
 
+	Parameters
+	----------
+	filename : dict
+		linecube name
+
+	Returns
+	-------
+	kin
+		Emission line kinematics
+	names
+		Measured column names 
+	"""
+
+	#Get data
 	hdul = fits.open(filename)
 	logLambda, spectra_list = read_spectra_hdul(hdul)
 	spectra = spectra_list[0]
-	# noise = spectra_list[1]
 	hdul.close()
 
+	#Get line name
 	line = filename.split('/')[-1].split('_subspectra')[0]
 	names = [f"{line}_V",f"{line}_sigma"]
 
-	linLambda = np.exp(logLambda)
-
-
+	#Set up arrays
 	V = np.zeros([spectra.shape[1]])
 	sigma = np.zeros([spectra.shape[1]])
 
 	for ii in range(spectra.shape[1]):
 		spectrum = spectra[:,ii]
-		# sigma = noise[:,ii]
-
 		spectrum_mask = spectrum > 0
 
-		d_logLambda = logLambda - np.log(emlines_indiv[line]['lambda'])
+		d_logLambda = logLambda - np.log(emlines_indiv[line]['lambda']) 			#Offset from rest value
 
 		if np.any(spectrum_mask):
-			V[ii] = c*weighted_moment(d_logLambda,weights=spectrum,moment=1) 
-			sigma[ii] = c*weighted_moment(d_logLambda,weights=spectrum,moment=2)
+			V[ii] = c*weighted_moment(d_logLambda,weights=spectrum,moment=1) 		#Velocity
+			sigma[ii] = c*weighted_moment(d_logLambda,weights=spectrum,moment=2) 	#Dispersion
 		else:
 			V[ii] = np.nan
 			sigma[ii] = np.nan
-
-
-
-		# plt.plot(linLambda,spectrum)
-		# plt.plot([weighted_moment(linLambda,weights=spectrum,moment=1)]*2,[0,np.max(spectrum)])
-		# plt.plot([weighted_moment(linLambda,weights=spectrum,moment=1)-weighted_moment(linLambda,weights=spectrum,moment=2),
-		# 			weighted_moment(linLambda,weights=spectrum,moment=1)-weighted_moment(linLambda,weights=spectrum,moment=2)],
-		# 			[0,np.max(spectrum)])
-		# plt.plot([weighted_moment(linLambda,weights=spectrum,moment=1)+weighted_moment(linLambda,weights=spectrum,moment=2),
-		# 			weighted_moment(linLambda,weights=spectrum,moment=1)+weighted_moment(linLambda,weights=spectrum,moment=2)],
-		# 			[0,np.max(spectrum)])
-		# plt.show()
-		# exit()
 	
 	kin = [V,sigma]
 
 	return  kin, names
 
+### Making maps
+def make_vorbins_map(parameters):
+	"""
+	Saves a map of the spatial bins
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes image to file
+	"""
+
+	spax_prop_file = f"{parameters['output_dir']}/spaxel_properties.fits"
+	spax_properties = Table.read(spax_prop_file)
+	meta = spax_properties.meta
+	NY = meta['NY']
+	NX = meta['NX']
+
+	img_grid = np.full([NY,NX],np.nan).flatten()
+	img_grid[np.asarray(spax_properties['spax_num'],dtype=int)] = spax_properties['vorbin_num']
+	img_grid = img_grid.reshape((NY,NX))
+
+	fig = plt.figure()
+	gs = gridspec.GridSpec(1,1)
+	ax = fig.add_subplot(gs[0,0])
+	ax.pcolormesh(img_grid,cmap='prism')
+	fig.savefig(f"{parameters['output_dir']}/figures/vorbin_map.png")
+
+def make_stelkin_map(parameters):
+	"""
+	Saves maps of the stellar kinematics
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes image to file
+	"""
+	spax_prop_file = f"{parameters['input_dir']}/spaxel_properties.fits"
+
+	fit_stellar_kinematics = f"{parameters['output_dir']}/bestfit_kinematics_fluxes.fits"
+
+	spax_properties = Table.read(spax_prop_file)
+	bestfit_stelkin = Table.read(fit_stellar_kinematics)
+
+	spax_properties = hstack((spax_properties,bestfit_stelkin))
+
+	meta = spax_properties.meta
+	NY = meta['NY']
+	NX = meta['NX']
+
+	img_grid = np.full([NY,NX],np.nan).flatten()
+	vorbin_nums = np.unique(spax_properties['vorbin_num'])
+	
+	refs = np.zeros_like(vorbin_nums,dtype=int)
+	for vv, vb in enumerate(vorbin_nums):
+		refs[vv] = np.where(spax_properties['vorbin_num'] == vb)[0][0]
+
+	#Loop over kinematic components
+	for comp in ['V_stellar','sigma_stellar','h3_stellar','h4_stellar']:
+		fig = plt.figure()
+		gs = gridspec.GridSpec(1,1)
+		ax = fig.add_subplot(gs[0,0])
+
+		img = copy.deepcopy(img_grid)
+		img[np.asarray(spax_properties['spax_num'],dtype=int)] = spax_properties[comp]
+		img = img.reshape((NY,NX))
+
+
+		if comp == 'V_stellar':
+			med_vel = np.nanmedian(spax_properties[comp][refs])
+			img -= med_vel
+			vmin = np.percentile(spax_properties[comp][refs]-med_vel,5)
+			vmax =np.percentile(spax_properties[comp][refs]-med_vel,95)
+			cmap = 'RdBu_r'
+
+			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
+
+		elif comp == 'sigma_stellar':
+			vmin = 0
+			vmax = 60
+			cmap = 'inferno'
+
+			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
+
+		else:
+			vmin = 0.005
+			vmax = -0.005
+			cmap = 'inferno'
+			iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax)
+
+		ax.set_aspect('equal')
+
+		fig.colorbar(iimmgg)
+		fig.savefig(f"{parameters['output_dir']}/figures/{comp}_map.png")
+		plt.close()
+
 def make_linecube_fluxmaps(parameterfile):
+	"""
+	Saves maps of the emission line fluxes
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes image to file
+	"""
 	parameters = read_parameterfile(parameterfile)
 
 	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
@@ -4723,17 +2633,10 @@ def make_linecube_fluxmaps(parameterfile):
 	Nx =  metadata['NX']
 	Ny =  metadata['NY']
 
-
 	img_grid = np.full((Ny,Nx),np.nan).flatten()
-
 	line_names = ['A_V']+emline_fluxes.keys()[2::2]
-	print(line_names)
-	# line_names = [line.split("_err")[0] for line in emline_fluxes.keys()]
-	# line_names = np.unique(line_names)
 
 	for ll, line in enumerate(line_names):
-
-
 		linemap = copy.deepcopy(img_grid)
 		linemap[np.array(spax_properties['spax_num'],dtype=int)] = spax_properties[f"{line}"]
 		linemap = linemap.reshape((Ny,Nx))
@@ -4753,10 +2656,7 @@ def make_linecube_fluxmaps(parameterfile):
 		if line == 'A_V':
 			img = ax1.pcolormesh(linemap,vmin=0,vmax=1)
 		else:
-			img = ax1.pcolormesh(np.log10(linemap),vmin=1,vmax=0.99*np.nanmax(np.log10(linemap)))
-		if f"{line}_err" in emline_fluxes.keys():
-			# ax1.pcolormesh(HAmap/HA_errmap,vmin=0.5,vmax=5)
-			ax1.contour(linemap/line_errmap,levels=[5],colors=['Black'])
+			img = ax1.pcolormesh(np.log10(linemap),vmin=0.5,vmax=4)
 
 		fig.colorbar(img,cax = cb_ax)
 		cb_ax.set_title(f'{line}')
@@ -4795,7 +2695,21 @@ def make_linecube_fluxmaps(parameterfile):
 
 			fig.savefig(f"{parameters['output_dir']}/figures/{line}_SNmap.png")
 			plt.close()
+
 def make_linecube_kinmaps(parameterfile):
+	"""
+	Saves maps of the emission line kinematics
+
+	Parameters
+	----------
+	parameters : dict
+		Dictionary of parameters
+
+	Returns
+	-------
+	Nothing
+		Writes image to file
+	"""
 	parameters = read_parameterfile(parameterfile)
 
 	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
@@ -4833,44 +2747,177 @@ def make_linecube_kinmaps(parameterfile):
 			if "_V" in comp:
 				good = np.isfinite(spax_properties[comp][refs])
 				med_vel = np.nanmedian(spax_properties[comp][refs][good])
-				# print(med_vel)
-				# print(spax_properties[comp][refs][good])
-				# print(np.percentile((spax_properties[comp][refs][good]-med_vel),5))
-				# print(np.percentile((spax_properties[comp][refs][good]-med_vel),95))
-				# exit()
 				img -= med_vel
 				vmin = -np.percentile((spax_properties[comp][refs][good]-med_vel),95)
 				vmax = np.percentile((spax_properties[comp][refs][good]-med_vel),95)
 				cmap = 'RdBu_r'
 
-				iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
+				iimmgg = ax.pcolormesh(img,vmin=-80,vmax=80,cmap=cmap)
 
 			elif "_sigma" in comp:
 				# vmin = 0
 				vmin = np.percentile(spax_properties[comp][refs][good],5)
 				vmax = np.percentile(spax_properties[comp][refs][good],95)
-				# vmax = 60
 				cmap = 'inferno'
 
-				iimmgg = ax.pcolormesh(img,vmin=vmin,vmax=vmax,cmap=cmap)
-
+				iimmgg = ax.pcolormesh(img,vmin=50,vmax=120,cmap=cmap)
 
 			ax.set_aspect('equal')
-
-			fig.colorbar(iimmgg)
-			# ax.scatter(spax_properties['spax_xx'],spax_properties['spax_yy'],c=spax_properties['vorbin_num'])
-			# plt.show()
-			fig.savefig(f"{parameters['output_dir']}/figures/{comp}_map.pdf")
+			fig.colorbar(iimmgg,label='km/s')
+			fig.savefig(f"{parameters['output_dir']}/figures/{comp}_map.png")
 			plt.close()
 
-			
+	
 
+
+#Useful things
+
+def EBV_Hlines(F1 ,F2 ,lambda1 ,lambda2 , Rint = 2.83,k_l = None):
+	#lambdas in angstrom
+	#F1=HA F2 = HB (default)
+	
+	if isinstance(k_l,type(None)):
+		k_l = lambda ll: extinction_curve(ll)
+
+	ratio = np.log10((F1/F2) / Rint)
+
+	kdiff = k_l(lambda2) - k_l(lambda1)
+
+	E_BV = ratio / (0.4 * kdiff)
+	# print(np.min(E_BV))
+
+	E_BV[np.isfinite(E_BV)==False] = 0
+	# print(np.min(E_BV))
+
+	return E_BV
+
+@np.vectorize
+def extinction_curve(ll, RV = 4, extcurve = 'Calzetti00'):
+	##ll should be in Angstrom
+	
+	if extcurve == 'Calzetti00':
+		ll *= 1.e-4 		#convert to micron
+		llinv = 1.e0/ll
+
+		if  ll >= 0.12 and ll < 0.63:
+			k = 2.659*(-2.156 + 1.509*llinv - 0.196*(llinv*llinv) + 0.011*(llinv*llinv*llinv)) + RV
+
+		elif ll >=0.63 and ll <=2.20:
+			k = 2.659*(-1.857 + 1.040*llinv) + RV
+		else:
+			k = np.nan
+
+	return k
+
+def create_spectrum_from_weights(parameterfile, weights, templates):
+
+		parameters = read_parameterfile(parameterfile)
+		
+		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
+
+		spax_properties = Table.read(spax_properties_file)
+		# print(spax_properties)
+		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
+		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
+
+		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
+
+
+		hdul = fits.open(spectra_file)
+		logLambda_spec, spectra  = read_spectra_hdul(hdul)
+		logRebin_spectra = spectra[0]
+		logRebin_noise = spectra[1]
+		spectra = None
+
+		header = hdul[0].header
+		hdul.close()
+		velscale = header['VELSCALE']
+		parameters['galaxy_velscale'] = float(velscale)	
+
+		print(parameters['galaxy_velscale'])
+
+
+		templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=False, convolve=False)
+		# plt.scatter(logLambda_templates,templates[:,0],s=3)
+		velscale_templates = c*np.diff(logLambda_templates)[0]
+		# print(velscale_templates)
+		# print(templates[:,0])
+
+		# print(vsr_temp)
+
+		# parameters['velscale_ratio'] = vsr_temp
+
+		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=True, convolve=False)
+		# plt.scatter(logLambda_templates,templates[:,0],s=3)
+		# velscale_templates = c*np.diff(logLambda_templates)[0]
+		# print(velscale_templates)
+		# print(templates[:,0])
+		
+		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=False, convolve=True)
+		# plt.scatter(logLambda_templates,templates[:,0],s=3)
+		# velscale_templates = c*np.diff(logLambda_templates)[0]
+		# print(velscale_templates)
+		# print(templates[:,0])
+
+
+
+		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=True, convolve=True)
+
+		# velscale_templates = c*np.diff(logLambda_templates)[0]
+		# print(velscale_templates)
+		# plt.scatter(logLambda_templates,templates[:,0],s=3)
+
+
+		
+
+		spec = pputils.convolve_gauss_hermite(templates, velscale_templates, pp.sol, galaxy.size,
+                                      velscale_ratio=ratio, vsyst=dv)
+
+		# The spectrum below is equal to pp.bestfit to machine precision
+
+		spectrum = (spec @ pp.weights)*pp.mpoly + pp.apoly
+
+def weighted_moment(data,weights=None,moment = 1):
+
+	if isinstance(weights,type(None)):
+		weights = np.ones_like(data)
+
+	if moment >= 1:
+		moment1 =  np.sum(data*weights) / np.sum(weights)
+		mom = moment1
+
+	if moment >= 2:
+		moment2 = np.sum(weights*(data - moment1)**2) / np.sum(weights)
+		moment2 = np.sqrt(moment2)
+		mom = moment2
+
+	if moment == 3:
+		mom = np.sum(weights * ((data - moment1) / moment2)**3) / np.sum(weights)
+
+	if moment == 4:
+		mom = np.sum(weights * ((data - moment1) / moment2)**4) / np.sum(weights) - 3
+
+	
+	return mom	
+
+def baselineFunc(xx,aa,bb,cc):
+	yy = aa*xx**2 + bb*xx + cc
+	return yy
+
+
+### Old functions for checking things ###
 def check_line_ratios(parameterfile):
 
 	parameters = read_parameterfile(parameterfile)
-
-
+	
+	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
 	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
+	emline_fluxes = hstack((spax_properties,emline_fluxes))
+
+	vorbin_nums = np.unique(spax_properties['vorbin_num'])
+	refs = np.zeros_like(vorbin_nums,dtype=int)
+	for vv, vb in enumerate(vorbin_nums):
+		refs[vv] = np.where(spax_properties['vorbin_num'] == vb)[0][0]
 
 	fig = plt.figure(figsize=(20,10))
 	gs = gridspec.GridSpec(4,1,hspace=0)
@@ -4905,26 +2952,26 @@ def check_line_ratios(parameterfile):
 
 	ax2 = fig.add_subplot(gs[1,0],sharey=ax1)
 	ax2.scatter(np.log10(emline_fluxes['Halpha']),
-				emline_fluxes['OIII4958']/emline_fluxes['OIII5006'],
+				emline_fluxes['OIII4959']/emline_fluxes['OIII5006'],
 				marker='o',s=0.5,color='Black')
 	
 	emline_fluxes_SN3 = emline_fluxes[
 						np.where(
-						(emline_fluxes['OIII4958']/emline_fluxes['OIII4958_err'] >=3) &
+						(emline_fluxes['OIII4959']/emline_fluxes['OIII4959_err'] >=3) &
 						(emline_fluxes['OIII5006']/emline_fluxes['OIII5006_err'] >=3))]
 
 	emline_fluxes_SN5 = emline_fluxes[
 						np.where(
-						(emline_fluxes['OIII4958']/emline_fluxes['OIII4958_err'] >=5) &
+						(emline_fluxes['OIII4959']/emline_fluxes['OIII4959_err'] >=5) &
 						(emline_fluxes['OIII5006']/emline_fluxes['OIII5006_err'] >=5))]
 
 
 	ax2.scatter(np.log10(emline_fluxes_SN3['Halpha']),
-				emline_fluxes_SN3['OIII4958']/emline_fluxes_SN3['OIII5006'],
+				emline_fluxes_SN3['OIII4959']/emline_fluxes_SN3['OIII5006'],
 				marker='o',s=0.5,color="DodgerBlue")
 
 	ax2.scatter(np.log10(emline_fluxes_SN5['Halpha']),
-				emline_fluxes_SN5['OIII4958']/emline_fluxes_SN5['OIII5006'],
+				emline_fluxes_SN5['OIII4959']/emline_fluxes_SN5['OIII5006'],
 				marker='o',s=0.5,color="Red")
 
 	ax2.plot([0,6],[0.3355,0.3355],color='Black',ls='--')
@@ -4980,6 +3027,8 @@ def check_line_ratios(parameterfile):
 	ax4.scatter(np.log10(emline_fluxes_SN5['Halpha']),
 				emline_fluxes_SN5['SII6716']/emline_fluxes_SN5['SII6730'],
 				marker='o',s=0.5,color="Red")
+	ax4.plot([0,6],[0.45,0.45],color='Black',ls='--')
+	ax4.plot([0,6],[1.45,1.45],color='Black',ls='--')
 
 
 	ax1.set_yscale('log')
@@ -5013,7 +3062,7 @@ def check_line_ratios(parameterfile):
 	ax2.set_xlim([1,6])
 	ax3.set_ylim([0.1,2])
 	ax3.set_xlim([1,6])
-	ax4.set_ylim([0.5,5])
+	ax4.set_ylim([0.2,4])
 	ax4.set_xlim([1,6])
 
 	legs = [Line2D([0],[0],color='White',marker='o',markerfacecolor='Black'),
@@ -5047,11 +3096,11 @@ def line_ratio_maps(parameterfile):
 				['NII6583','Halpha'],
 				['SII6716','Halpha'],
 				['SII6730','Halpha'],
-				['OIII4958','Hbeta'],
+				['OIII4959','Hbeta'],
 				['OIII5006','Hbeta'],
 				['Halpha','Hbeta'],
 				['NII6548','NII6583'],
-				['OIII4958', 'OIII5006'],
+				['OIII4959', 'OIII5006'],
 				['SII6716','SII6730']
 				]
 	ratio_limits = [[-1.5,-0.5],
@@ -5166,247 +3215,6 @@ def line_ratio_maps(parameterfile):
 			ax1.set_ylabel("pix",fontsize=15)
 			ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
 			fig.savefig(f"{parameters['output_dir']}/figures/AV_map.png")
-
-
-def metallicity_Curti17(parameterfile,method='O3N2'):	
-	#R2 = OII3727/Hbeta
-	#R3= OIII5007/Hbeta
-	#R23 = (OII3727+OIII4959,5007)/Hbeta
-	#O32 = OIII5007/OII3727
-	#N2 = NII6584/Halpha
-	#O3N2 = OIII5007/Hbeta / NII6584/Halpha
-
-	methods = {'R2':{'coeffs':[0.418,-0.961, -3.505,-1.949],'lims':[7.6,8.3]},
-				'R3':{'coeffs':[-0.277 ,-3.549 ,-3.593 ,-0.981],'lims':[8.3,8.85]},
-				'O32':{'coeffs':[-0.691 ,-2.944 ,-1.308],'lims':[7.6,8.85]},
-				'R23':{'coeffs':[0.527 ,-1.569 ,-1.652 ,-0.421],'lims':[8.4,8.85]},
-				'N2':{'coeffs':[-0.489, 1.513,-2.554, -5.293, -2.867],'lims':[7.6,8.85]},
-				'O3N2':{'coeffs':[0.281,-4.765,-2.268],'lims':[7.6,8.85]}
-				}
-
-
-	parameters = read_parameterfile(parameterfile)
-
-	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
-
-	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
-
-	spax_properties = hstack((spax_properties,emline_fluxes))
-
-	
-	if method =='R2':
-		SNgood = np.where((spax_properties['OII3727']/spax_properties['OII3727_err'] >=4) & 
-						(spax_properties['Hbeta']/spax_properties['Hbeta_err'] >=4))[0]
-
-		ratio = (spax_properties['OII3727_extcorr'] / spax_properties['Hbeta_extcorr'])[SNgood]
-		log_ratio = np.log10(ratio)
-
-	elif method == 'R3':
-
-		SNgood = np.where((spax_properties['OIII5006']/spax_properties['OIII5006_err'] >=4) & 
-						(spax_properties['Hbeta']/spax_properties['Hbeta_err'] >=4))[0]
-
-		ratio = (spax_properties['OIII5006_extcorr'] / spax_properties['Hbeta_extcorr'])[SNgood]
-		log_ratio = np.log10(ratio)
-
-	elif method == 'R23':
-		SNgood = np.where((spax_properties['OIII5006']/spax_properties['OIII5006_err'] >=4) & 
-						(spax_properties['OII3727']/spax_properties['OII3727_err'] >=4) &
-						(spax_properties['Hbeta']/spax_properties['Hbeta_err'] >=4))[0]
-
-		ratio = ((spax_properties['OIII5006_extcorr'] + spax_properties['OII3727_extcorr']) /
-					spax_properties['Hbeta_extcorr'] )[SNgood]
-		log_ratio = np.log10(ratio)
-
-	elif method == 'O32':
-		SNgood = np.where((spax_properties['OIII5006']/spax_properties['OIII5006_err'] >=4) & 
-						(spax_properties['OII3727']/spax_properties['OII3727_err'] >=4))[0]
-
-		ratio = (spax_properties['OIII5006_extcorr'] / spax_properties['OII3727_extcorr'])[SNgood]
-		log_ratio = np.log10(ratio)
-
-	elif method == 'N2':
-
-		SNgood = np.where((spax_properties['NII6583']/spax_properties['NII6583_err'] >=4) & 
-						(spax_properties['Halpha']/spax_properties['Halpha_err'] >=4))[0]
-
-		ratio = (spax_properties['NII6583_extcorr'] / spax_properties['Halpha_extcorr'])[SNgood]
-		log_ratio = np.log10(ratio)
-
-	elif method == 'O3N2':
-
-		SNgood = np.where((spax_properties['NII6583']/spax_properties['NII6583_err'] >=4) & 
-					(spax_properties['Halpha']/spax_properties['Halpha_err'] >=4) &
-					(spax_properties['OIII5006']/spax_properties['OIII5006_err'] >=4) & 
-					(spax_properties['Hbeta']/spax_properties['Hbeta_err'] >=4))[0]
-
-
-		ratio = ( (spax_properties['OIII5006_extcorr'][:] / spax_properties['Hbeta_extcorr'][:]) 
-				/ (spax_properties['NII6583_extcorr'][:] / spax_properties['Halpha_extcorr'][:]) )[SNgood]
-		log_ratio = np.log10(ratio)
-
-
-
-	# plt.hist(log_ratio,bins=100)
-	# plt.show()
-	# exit()
-
-	method_coeffs = methods[method]
-	logOH_range = np.linspace(method_coeffs['lims'][0],method_coeffs['lims'][1],1000)
-	logRatio_range  = np.zeros_like(logOH_range)
-	for ii in range(len(method_coeffs['coeffs'])):
-		# print(method_coeffs['coeffs'][ii])
-		logRatio_range += method_coeffs['coeffs'][ii] * np.power(logOH_range-8.69,ii)
-
-	# plt.plot(logOH_range,logRatio_range)
-	# plt.show()
-	# exit()
-
-	min_logRatio = np.min(logRatio_range)
-	max_logRatio = np.max(logRatio_range)
-
-	# print(min_logRatio,max_logRatio)
-
-	# spaxel_logOH = np.zeros_like(log_ratio)
-	# spaxel_logOH = np.full_like(log_ratio,-1)
-
-	# print(logRatio_range[::-1])
-
-
-	if logRatio_range[0]>logRatio_range[-1]:
-		logRatio_range = logRatio_range[::-1]
-		logOH_range = logOH_range[::-1]
-	spaxel_logOH = np.interp(log_ratio,logRatio_range,logOH_range)
-	# bad_spax = 
-	spaxel_logOH[(log_ratio < min_logRatio)] = np.nan
-	spaxel_logOH[ (log_ratio > max_logRatio)] = np.nan
-
-
-
-	spaxel_logOH_full = np.full(len(spax_properties),np.nan)
-
-	#re-distribute QC spectra to whole list
-	for nn,vv in enumerate(SNgood):
-		spaxel_logOH_full[vv] = spaxel_logOH[nn]
-
-
-	metadata = spax_properties.meta
-	Nx =  metadata['NX']
-	Ny =  metadata['NY']
-
-
-	img_grid = np.full((Ny,Nx),np.nan).flatten()
-
-	img_grid[np.array(spax_properties['spax_num'],dtype=int)] =	spaxel_logOH_full
-	img_grid = img_grid.reshape((Ny,Nx))
-
-
-	p90 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],90)
-	p50 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],50)
-	p10 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],10)
-
-
-	fig = plt.figure(figsize=(12,10))
-	gs = gridspec.GridSpec(1,2,width_ratios = [1,0.05])
-
-
-	ax1 = fig.add_subplot(gs[0,0])
-	cb_ax = fig.add_subplot(gs[0,1])
-
-	img = ax1.pcolormesh(img_grid,vmin=p10,vmax=p90)
-
-
-	fig.colorbar(img,cax = cb_ax)
-
-	cb_ax.set_title(f'12+ log(O/H) [{method}]')
-	cb_ax.tick_params(which='both',axis='both',direction='in')
-
-
-	ax1.set_aspect("equal")
-	ax1.set_xlabel("pix",fontsize=15)
-	ax1.set_ylabel("pix",fontsize=15)
-	ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
-
-	fig.savefig(f"{parameters['output_dir']}/figures/logOH_map_{method}.png")
-	# plt.show()
-def metallicity_Dopita16(parameterfile):
-
-	parameters = read_parameterfile(parameterfile)
-
-	spax_properties = Table.read(f"{parameters['input_dir']}/spaxel_properties.fits")
-
-	emline_fluxes = Table.read(f"{parameters['output_dir']}/spax_emline_fluxes.fits")
-
-	spax_properties = hstack((spax_properties,emline_fluxes))
-
-
-	SNgood = np.where((spax_properties['OIII5006']/spax_properties['OIII5006_err'] >=4) & 
-					(spax_properties['NII6583']/spax_properties['NII6583_err'] >=4) & 
-					(spax_properties['Halpha']/spax_properties['Halpha_err'] >=4) &
-					(spax_properties['SII6716']/spax_properties['SII6716_err'] >=4))[0]
-
-
-
-
-	y = (np.log10(spax_properties['NII6583_extcorr']/spax_properties['SII6716_extcorr']) + \
-		0.264 * np.log10(spax_properties['NII6583_extcorr'] / spax_properties['Halpha_extcorr']))[SNgood]
-
-	# plt.hist(y,bins=100)
-	# plt.show()
-
-	spaxel_logOH = 8.77 + y
-	# spaxel_logOH = 8.77 + y + 0.45*(y+0.3)**5
-
-
-
-	spaxel_logOH_full = np.full(len(spax_properties),np.nan)
-
-	#re-distribute QC spectra to whole list
-	for nn,vv in enumerate(SNgood):
-		spaxel_logOH_full[vv] = spaxel_logOH[nn]
-
-
-	metadata = spax_properties.meta
-	Nx =  metadata['NX']
-	Ny =  metadata['NY']
-
-
-	img_grid = np.full((Ny,Nx),np.nan).flatten()
-
-	img_grid[np.array(spax_properties['spax_num'],dtype=int)] =	spaxel_logOH_full
-	img_grid = img_grid.reshape((Ny,Nx))
-
-
-	p90 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],90)
-	p50 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],50)
-	p10 = np.percentile(spaxel_logOH[np.isfinite(spaxel_logOH)],10)
-
-
-	fig = plt.figure(figsize=(12,10))
-	gs = gridspec.GridSpec(1,2,width_ratios = [1,0.05])
-
-
-	ax1 = fig.add_subplot(gs[0,0])
-	cb_ax = fig.add_subplot(gs[0,1])
-
-	img = ax1.pcolormesh(img_grid,vmin=p10,vmax=p90)
-
-
-	fig.colorbar(img,cax = cb_ax)
-
-	cb_ax.set_title(f'12+ log(O/H) [Dopita16]')
-	cb_ax.tick_params(which='both',axis='both',direction='in')
-
-
-	ax1.set_aspect("equal")
-	ax1.set_xlabel("pix",fontsize=15)
-	ax1.set_ylabel("pix",fontsize=15)
-	ax1.tick_params(which='both',axis='both',direction='in',labelsize=12)
-
-	fig.savefig(f"{parameters['output_dir']}/figures/logOH_map_Dopita16.png")
-	# plt.show()
-
-
 def make_BPT_diagram(parameterfile):
 	parameters = read_parameterfile(parameterfile)
 
@@ -5482,278 +3290,6 @@ def make_BPT_diagram(parameterfile):
 	fig.savefig(f"{parameters['output_dir']}/figures/BPTs.png")
 	# plt.show()
 
-
-
-def fit_O3_line_components(parameterfile):
-	parameters =  read_parameterfile(parameterfile)
-
-
-	spectra_file = f"{parameters['input_dir']}/linecubes/OIII5006_subspectra.fits"
-	hdul = fits.open(spectra_file)
-	logLambda_spec, spectra  = read_spectra_hdul(hdul)
-	logRebin_spectra = spectra[0]
-	logRebin_noise = spectra[1]
-	spectra = None
-
-
-	spectrum = logRebin_spectra[:,10500]
-
-	from scipy.optimize import curve_fit
-
-	coeffs = []
-	covars = []
-	fits_all = []
-	for ii in range(4):
-		if ii+1 == 1:
-			fit_coeff, covar = curve_fit(gaussian1,logLambda_spec,spectrum,p0=[0.5*np.sum(spectrum),np.mean(logLambda_spec),0.0005])
-			fit = [gaussian1(logLambda_spec,fit_coeff[0],fit_coeff[1],fit_coeff[2])]
-			coeffs.append(fit_coeff)
-			covars.append(covar)
-			fits_all.append(fit)
-		if ii+1 == 2:
-			fit_coeff, covar = curve_fit(gaussian2,logLambda_spec,spectrum,
-												p0=[0.25*np.sum(spectrum),np.mean(logLambda_spec),0.0005,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001])
-			fit = [gaussian1(logLambda_spec,fit_coeff[0],fit_coeff[1],fit_coeff[2]),
-					gaussian1(logLambda_spec,fit_coeff[3],fit_coeff[4],fit_coeff[5]) ]
-			coeffs.append(fit_coeff)
-			covars.append(covar)
-			fits_all.append(fit)
-		if ii+1 == 3:
-			fit_coeff, covar = curve_fit(gaussian3,logLambda_spec,spectrum,
-											p0=[0.25*np.sum(spectrum),np.mean(logLambda_spec),0.0005,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001])
-			fit = [gaussian1(logLambda_spec,fit_coeff[0],fit_coeff[1],fit_coeff[2]),
-					gaussian1(logLambda_spec,fit_coeff[3],fit_coeff[4],fit_coeff[5]),
-					gaussian1(logLambda_spec,fit_coeff[6],fit_coeff[7],fit_coeff[8])]
-			coeffs.append(fit_coeff)
-			covars.append(covar)
-			fits_all.extend(fit)
-		if ii+1 == 4:
-			fit_coeff, covar = curve_fit(gaussian4,logLambda_spec,spectrum,
-												p0=[0.25*np.sum(spectrum),np.mean(logLambda_spec),0.0005,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001,
-												0.25*np.sum(spectrum),np.mean(logLambda_spec),0.001])
-			fit = [gaussian1(logLambda_spec,fit_coeff[0],fit_coeff[1],fit_coeff[2]),
-					gaussian1(logLambda_spec,fit_coeff[3],fit_coeff[4],fit_coeff[5]),
-					gaussian1(logLambda_spec,fit_coeff[6],fit_coeff[7],fit_coeff[8]),
-					gaussian1(logLambda_spec,fit_coeff[9],fit_coeff[10],fit_coeff[11])]
-			coeffs.append(fit_coeff)
-			covars.append(covar)
-			fits_all.extend(fit)
-
-
-
-		print(fit_coeff)
-		plt.plot(logLambda_spec,spectrum)
-		# plt.plot(logLambda_spec,gaussian1(logLambda_spec,7000,8.519,0.001))
-		for ff in range(len(fit)):
-			plt.plot(logLambda_spec,fit[ff])
-		plt.show()
-
-
-
-def gaussian1(xx,A1, mu1, sigma1):
-	# prob = 1. / (sigma*np.sqrt(2.e0 * np.pi)) * \
-			# np.exp(-0.5e0*( ((xx - mu) / sigma) *((xx - mu) / sigma) ))
-	gg = np.abs(A1)*np.exp(-0.5e0*( ((xx - mu1) / sigma1) *((xx - mu1) / sigma1) ))
-	return gg
-def gaussian2(xx,A1, mu1, sigma1,A2, mu2, sigma2):
-	gg = np.abs(A1)*np.exp(-0.5e0*( ((xx - mu1) / sigma1) *((xx - mu1) / sigma1) )) +\
-		np.abs(A2)*np.exp(-0.5e0*( ((xx - mu2) / sigma2) *((xx - mu2) / sigma2) ))
-	return gg
-def gaussian3(xx,A1, mu1, sigma1,A2, mu2, sigma2,A3, mu3, sigma3):
-	gg = np.abs(A1)*np.exp(-0.5e0*( ((xx - mu1) / sigma1) *((xx - mu1) / sigma1) )) +\
-		np.abs(A2)*np.exp(-0.5e0*( ((xx - mu2) / sigma2) *((xx - mu2) / sigma2) )) +\
-		np.abs(A3)*np.exp(-0.5e0*( ((xx - mu3) / sigma3) *((xx - mu3) / sigma3) ))
-	return gg
-def gaussian4(xx,A1, mu1, sigma1,A2, mu2, sigma2,A3, mu3, sigma3,A4, mu4, sigma4):
-	gg = np.abs(A1)*np.exp(-0.5e0*( ((xx - mu1) / sigma1) *((xx - mu1) / sigma1) )) +\
-		np.abs(A2)*np.exp(-0.5e0*( ((xx - mu2) / sigma2) *((xx - mu2) / sigma2) )) +\
-		np.abs(A3)*np.exp(-0.5e0*( ((xx - mu3) / sigma3) *((xx - mu3) / sigma3) ))+\
-		np.abs(A4)*np.exp(-0.5e0*( ((xx - mu4) / sigma4) *((xx - mu4) / sigma4) ))
-
-	return gg
-
-def norm_gaussian(xx,A,mu,sigma):
-	
-	prob = 1. / (sigma*np.sqrt(2.e0 * np.pi)) * \
-			np.exp(-0.5e0*( ((xx - mu) / sigma) *((xx - mu) / sigma) ))
-	return prob
-
-#useful things
-
-
-def MUSE_LSF_Bacon17(ll, z = 0):
-	ll = ll*(1.e0 + z)										#convert rest-frame wavelength to observed frame
-	FWHM = 5.866e-8 * ll*ll - 9.187e-4 * ll + 6.040 		#get LSF at observed-frame wavelength
-	FWHM = FWHM / (1.e0 + z)								#convert obs-frame LSF to narrower de-redshifted value
-
-	return FWHM
-
-
-def EBV_Hlines(F1 ,F2 ,lambda1 ,lambda2 , Rint = 2.83,k_l = None):
-	#lambdas in angstrom
-	#F1=HA F2 = HB (default)
-	
-	if isinstance(k_l,type(None)):
-		k_l = lambda ll: extinction_curve(ll)
-
-	ratio = np.log10((F1/F2) / Rint)
-
-	kdiff = k_l(lambda2) - k_l(lambda1)
-
-	E_BV = ratio / (0.4 * kdiff)
-	# print(np.min(E_BV))
-
-	E_BV[np.isfinite(E_BV)==False] = 0
-	# print(np.min(E_BV))
-
-	return E_BV
-
-@np.vectorize
-def extinction_curve(ll, RV = 4, extcurve = 'Calzetti00'):
-	##ll should be in Angstrom
-	
-	if extcurve == 'Calzetti00':
-		ll *= 1.e-4 		#convert to micron
-		llinv = 1.e0/ll
-
-		if  ll >= 0.12 and ll < 0.63:
-			k = 2.659*(-2.156 + 1.509*llinv - 0.196*(llinv*llinv) + 0.011*(llinv*llinv*llinv)) + RV
-
-		elif ll >=0.63 and ll <=2.20:
-			k = 2.659*(-1.857 + 1.040*llinv) + RV
-		else:
-			k = np.nan
-
-	return k
-
-
-def extract_subcube(datacube,subcube_index,filepath = True,hdu=0):
-
-	if filepath:
-		cube = SpectralCube.read(datacube,hdu=hdu)
-	elif not filepath:
-		cube = SpectralCube(data=datacube[0],wcs=datacube[1])
-
-	if subcube_index[0]=='all':
-		subcube = cube[:,
-					int(subcube_index[1][0]):int(subcube_index[1][1]),
-					int(subcube_index[2][0]):int(subcube_index[2][1])]
-	else:
-		subcube = cube[int(subcube_index[0][0]):int(subcube_index[0][1]),
-					int(subcube_index[1][0]):int(subcube_index[1][1]),
-					int(subcube_index[2][0]):int(subcube_index[2][1])]
-
-	return subcube
-
-
-def create_spectrum_from_weights(parameterfile, weights, templates):
-
-		parameters = read_parameterfile(parameterfile)
-		
-		spax_properties_file = f"{parameters['input_dir']}/spaxel_properties.fits"
-
-		spax_properties = Table.read(spax_properties_file)
-		# print(spax_properties)
-		vorbin_nums = np.array(spax_properties['vorbin_num'][:])
-		vorbin_nums = np.sort(np.unique(vorbin_nums[vorbin_nums>=0]))
-
-		spectra_file = f"{parameters['input_dir']}/logRebin_spectra.fits"
-
-
-		hdul = fits.open(spectra_file)
-		logLambda_spec, spectra  = read_spectra_hdul(hdul)
-		logRebin_spectra = spectra[0]
-		logRebin_noise = spectra[1]
-		spectra = None
-
-		header = hdul[0].header
-		hdul.close()
-		velscale = header['VELSCALE']
-		parameters['galaxy_velscale'] = float(velscale)	
-
-		print(parameters['galaxy_velscale'])
-
-
-		templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=False, convolve=False)
-		# plt.scatter(logLambda_templates,templates[:,0],s=3)
-		velscale_templates = c*np.diff(logLambda_templates)[0]
-		# print(velscale_templates)
-		# print(templates[:,0])
-
-		# print(vsr_temp)
-
-		# parameters['velscale_ratio'] = vsr_temp
-
-		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=True, convolve=False)
-		# plt.scatter(logLambda_templates,templates[:,0],s=3)
-		# velscale_templates = c*np.diff(logLambda_templates)[0]
-		# print(velscale_templates)
-		# print(templates[:,0])
-		
-		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=False, convolve=True)
-		# plt.scatter(logLambda_templates,templates[:,0],s=3)
-		# velscale_templates = c*np.diff(logLambda_templates)[0]
-		# print(velscale_templates)
-		# print(templates[:,0])
-
-
-
-		# templates, logLambda_templates = read_EMILES_spectra(parameters, match_velscale=True, convolve=True)
-
-		# velscale_templates = c*np.diff(logLambda_templates)[0]
-		# print(velscale_templates)
-		# plt.scatter(logLambda_templates,templates[:,0],s=3)
-
-
-		
-
-		spec = pputils.convolve_gauss_hermite(templates, velscale_templates, pp.sol, galaxy.size,
-                                      velscale_ratio=ratio, vsyst=dv)
-
-		# The spectrum below is equal to pp.bestfit to machine precision
-
-		spectrum = (spec @ pp.weights)*pp.mpoly + pp.apoly
-
-
-def weighted_moment(data,weights=None,moment = 1):
-
-	if isinstance(weights,type(None)):
-		weights = np.ones_like(data)
-
-	if moment >= 1:
-		moment1 =  np.sum(data*weights) / np.sum(weights)
-		mom = moment1
-
-	if moment >= 2:
-		moment2 = np.sum(weights*(data - moment1)**2) / np.sum(weights)
-		moment2 = np.sqrt(moment2)
-		mom = moment2
-
-	if moment == 3:
-		mom = np.sum(weights * ((data - moment1) / moment2)**3) / np.sum(weights)
-
-	if moment == 4:
-		mom = np.sum(weights * ((data - moment1) / moment2)**4) / np.sum(weights) - 3
-
-	
-	return mom	
-
-
-
 if __name__ == '__main__':
-	main()
-	# read_EMILES_spectra()
-	# read_parameterfile()
-	# read_gaslines_parameterfile()
-
-	# make_spectra_tables()
-
-
-	# voronoi_bin_cube(SN_indiv = 5, SN_vorbin = 40)
-
-	# create_binned_spectra()
+	print("Fuctions not called this way, load library and use e.g. lilpPXF.run()")
+	
