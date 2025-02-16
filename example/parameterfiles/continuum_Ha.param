@@ -1,0 +1,14 @@
+#input and output dirs
+datacube /Users/00088350/Downloads/NGC4383.fits
+input_dir Halphabinned
+output_dir Halphabinned
+
+
+#individual_continuum
+binned_contsub True
+contsub_level bin
+
+
+
+
+

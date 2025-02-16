@@ -1,0 +1,16 @@
+#input and output dirs
+datacube /Users/00088350/Downloads/NGC4383.fits
+input_dir SN40_stelkin
+output_dir Halphabinned
+
+#voronoi binning
+run_vorbin True
+vorbin_SNname Halpha
+vorbin_SNmin -99
+vorbin_SNtarget 10
+
+binned_contsub True
+contsub_level bin
+
+
+

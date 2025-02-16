@@ -1,0 +1,15 @@
+#input and output dirs
+input_dir indiv
+output_dir SN40
+
+#voronoi binning
+run_vorbin True
+spatial_mask /Users/00088350/Research/projects/MAUVE/spectral_fitting/NGC4383/NGC4383_continuum_mask.fits
+vorbin_SNname cont
+vorbin_SNmin -99
+vorbin_SNtarget 40
+
+
+
+
+

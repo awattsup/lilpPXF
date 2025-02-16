@@ -1,0 +1,8 @@
+#Data reading parameters
+
+read_data True
+datacube /Users/00088350/Research/data/NGC4383/NGC4383_DATACUBE_mosaic.fits
+output_dir ./
+z 0.005543
+lrange 4750 9100
+SN_lrange 5300 5500

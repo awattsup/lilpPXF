@@ -1,0 +1,39 @@
+#EXAMPLE FILE
+
+read_data True
+datacube 			#Path to your data
+#input and output dirs		
+input_dir indiv			#Source directory
+output_dir indiv		#Output directory
+output_dir ./
+z 0.005543			#Redshift
+lrange 4750 9100		#Wavelength range (low, high) in Angstrom for clipping spectra
+SN_lrange 5300 5500		#Wavelength range (low, high) in Angstrom for measuring S/N
+
+
+#voronoi binning
+run_vorbin True			#Run spatial binning
+spatial_mask mask.fits		#Additional spatial mask
+vorbin_SNname Halpha		#Name of parameter to bin on (e.g. "cont")
+vorbin_SNmin -99		#Minimum S/N
+vorbin_SNtarget 10		#Target S/N
+
+#Stellar kinematics		
+run_fit True			#Run fitting
+stellar_templates MILES		#Templates to use
+fit_lrange 4750 7000		#Wavelength range (low, high) in Angstroms to fit
+stars_moments 4			#Number of stellar kinematic moments
+degree 0			#Additive polynomial order
+mdegree 12			#Multiplicative polynomial order
+stars_start 0 50		#Initial kinematics guesses (V, sigma, h3, h4...)
+stelkin_outputs True		#Make stellar kinematics map
+
+#Contsub
+continuum_outputs True		#Make continuum-subtracted outputs
+contsub_level spax		#Level of continuum subtraction and products. spax = normalise to pixel level. bin = save all pixels in bin with the bin spectrum
+
+#Contsub of rebinned-data
+binned_contsub True		#Re-measure contiuum-subtracted outputs (useful if re-binning on emission lines)
+
+
+

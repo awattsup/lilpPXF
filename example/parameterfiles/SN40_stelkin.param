@@ -1,0 +1,22 @@
+#input and output dirs
+#output Research/projects/MAUVE/spectral_fitting/NGC4383/outputs
+input_dir SN40
+output_dir SN40_stelkin
+
+datacube /Users/00088350/Downloads/NGC4383.fits
+
+
+#Stellar kinematics
+run_fit True
+stellar_templates MILES
+fit_lrange 4750 7000
+stars_moments 4
+degree 0
+mdegree 12
+stars_start 0 50
+stelkin_outputs True
+continuum_outputs True
+contsub_level spax
+
+
+
